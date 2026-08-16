@@ -349,7 +349,53 @@ function chargerDB(){
   }
   return JSON.parse(raw);
 }
-function sauverDB(){ localStorage.setItem(DB_KEY, JSON.stringify(DB)); }
+let firestoreWriting = false;
+let firestoreLastJSON = null;
+
+function sauverDB(){
+  localStorage.setItem(DB_KEY, JSON.stringify(DB));
+  syncVersFirestore();
+}
+
+function syncVersFirestore(){
+  if(!window.FB) return; // Firebase pas encore prêt
+  const json = JSON.stringify(DB);
+  if(json === firestoreLastJSON) return;
+  firestoreLastJSON = json;
+  firestoreWriting = true;
+  window.FB.setDoc(window.FB.docRef, { data: json, updatedAt: Date.now() })
+    .catch(e => console.error("Sync Firestore (écriture) échouée :", e))
+    .finally(() => { firestoreWriting = false; });
+}
+
+async function initFirebaseSync(){
+  if(!window.FB) return;
+  try{
+    const snap = await window.FB.getDoc(window.FB.docRef);
+    if(snap.exists() && snap.data().data){
+      DB = JSON.parse(snap.data().data);
+      firestoreLastJSON = snap.data().data;
+      localStorage.setItem(DB_KEY, JSON.stringify(DB));
+    } else {
+      // Aucune donnée distante : on envoie la base locale comme point de départ
+      syncVersFirestore();
+    }
+  }catch(e){
+    console.error("Sync Firestore (lecture initiale) échouée :", e);
+  }
+  window.FB.onSnapshot(window.FB.docRef, (snap) => {
+    if(firestoreWriting) return;
+    if(!snap.exists()) return;
+    const remote = snap.data();
+    if(!remote || !remote.data || remote.data === firestoreLastJSON) return;
+    firestoreLastJSON = remote.data;
+    DB = JSON.parse(remote.data);
+    localStorage.setItem(DB_KEY, JSON.stringify(DB));
+    if(utilisateurCourant) rafraichirTout();
+  }, (err) => console.error("Sync Firestore (écoute) échouée :", err));
+  if(utilisateurCourant) rafraichirTout();
+}
+window.initFirebaseSync = initFirebaseSync;
 
 let DB = chargerDB();
 let utilisateurCourant = null;
@@ -1050,14 +1096,9 @@ function importerDonnees(e){
 }
 </script>
 <script type="module">
-  // Import the functions you need from the SDKs you need
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-app.js";
-  import { getAnalytics } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-analytics.js";
-  // TODO: Add SDKs for Firebase products that you want to use
-  // https://firebase.google.com/docs/web/setup#available-libraries
+  import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore.js";
 
-  // Your web app's Firebase configuration
-  // For Firebase JS SDK v7.20.0 and later, measurementId is optional
   const firebaseConfig = {
     apiKey: "AIzaSyCNuLvy5mnSUv7JaxbHHPx7l8H-pe1q8jo",
     authDomain: "gestion-de-licence-zone13c.firebaseapp.com",
@@ -1068,9 +1109,20 @@ function importerDonnees(e){
     measurementId: "G-L7WEC2RV0S"
   };
 
-  // Initialize Firebase
   const app = initializeApp(firebaseConfig);
-  const analytics = getAnalytics(app);
+  const firestore = getFirestore(app);
+  const docRef = doc(firestore, "zone13c_cadets", "db");
+
+  window.FB = {
+    docRef,
+    getDoc: (ref) => getDoc(ref),
+    setDoc: (ref, data) => setDoc(ref, data),
+    onSnapshot: (ref, next, error) => onSnapshot(ref, next, error)
+  };
+
+  if(window.initFirebaseSync){
+    window.initFirebaseSync();
+  }
 </script>
 </body>
 </html>
