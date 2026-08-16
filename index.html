@@ -232,7 +232,7 @@
 
     <div class="panel" id="panel-joueur">
       <div class="card">
-        <h2>Enregistrement Joueur — Catégorie Cadette (12-14 ans)</h2>
+        <h2>Enregistrement Joueur — Catégorie Cadette (13-16 ans)</h2>
         <div id="joueurMsg"></div>
         <div class="grid">
           <div class="field" id="jAscWrap">
@@ -256,7 +256,7 @@
             <label>Extrait de naissance (PDF) *</label>
             <div class="photo-drop" id="extraitDrop" onclick="document.getElementById('jExtrait').click()">
               📄 Cliquer pour choisir le fichier PDF
-              <input type="file" id="jExtrait" accept="application/pdf" style="display:none" onchange="previewExtrait(event)">
+              <input type="file" id="jExtrait" accept="application/pdf,image/*" style="display:none" onchange="previewExtrait(event)">
               <div id="extraitPreviewWrap" style="font-size:12px;color:#1a5c2e;margin-top:6px"></div>
             </div>
             <p style="font-size:11px;color:#777;margin-top:4px">Document obligatoire, utilisé pour confirmer la date de naissance déclarée.</p>
@@ -331,7 +331,7 @@
    DONNÉES — stockage local navigateur (localStorage)
    ========================================================= */
 const DB_KEY = "zone13c_db_v1";
-const AGE_MIN = 12, AGE_MAX = 14, JOUEURS_MAX = 22;
+const AGE_MIN = 13, AGE_MAX = 16, JOUEURS_MAX = 22;
 const SAISON_COURANTE = "2025-2026";
 
 function chargerDB(){
@@ -597,8 +597,8 @@ function previewPhoto(e){
 function previewExtrait(e){
   const file = e.target.files[0];
   if(!file) return;
-  if(file.type !== 'application/pdf'){
-    alert("Le fichier doit être un PDF.");
+  if(file.type !== 'application/pdf' && !file.type.startsWith('image/')){
+    alert("Le fichier doit être un PDF ou une image.");
     e.target.value='';
     return;
   }
