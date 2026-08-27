@@ -70,6 +70,18 @@
     cursor:pointer;background:#fafdfb;font-size:13px;color:#667;
   }
   .photo-drop img{max-width:100px;max-height:100px;border-radius:6px;margin-top:8px;}
+  .crop-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;align-items:center;justify-content:center;}
+  .crop-overlay.active{display:flex;}
+  .crop-box{background:#fff;border-radius:10px;padding:18px;width:92%;max-width:420px;text-align:center;}
+  .crop-box h3{margin:0 0 12px;font-size:15px;color:var(--vert-foot);}
+  .crop-stage{position:relative;width:280px;height:280px;margin:0 auto;overflow:hidden;background:#222;border-radius:6px;touch-action:none;}
+  .crop-stage img{position:absolute;left:0;top:0;user-select:none;-webkit-user-drag:none;cursor:grab;}
+  .crop-frame{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);border:2px solid var(--jaune);box-shadow:0 0 0 2000px rgba(0,0,0,.5);pointer-events:none;}
+  .crop-box input[type=range]{width:100%;margin:12px 0;}
+  .crop-actions{display:flex;gap:10px;justify-content:center;margin-top:10px;}
+  .crop-actions button{padding:9px 18px;border:none;border-radius:6px;font-size:13px;cursor:pointer;}
+  .crop-actions .btn-ok{background:var(--vert-foot);color:#fff;}
+  .crop-actions .btn-cancel{background:#ddd;color:#333;}
   #canvaLicence{
     border:1px solid #ddd;border-radius:8px;max-width:100%;height:auto;
     box-shadow:0 2px 10px rgba(0,0,0,.15);
@@ -249,11 +261,25 @@
         </div>
         <div class="grid">
           <div class="field" style="max-width:260px">
-            <label>Photo du joueur</label>
+            <label>Photo du joueur *</label>
             <div class="photo-drop" id="photoDrop" onclick="document.getElementById('jPhoto').click()">
               📷 Cliquer pour choisir une photo
               <input type="file" id="jPhoto" accept="image/*" style="display:none" onchange="previewPhoto(event)">
               <div id="photoPreviewWrap"></div>
+            </div>
+          </div>
+          <div class="crop-overlay" id="cropOverlay">
+            <div class="crop-box">
+              <h3>Rogner la photo</h3>
+              <div class="crop-stage" id="cropStage">
+                <img id="cropImg" src="">
+                <div class="crop-frame" id="cropFrame"></div>
+              </div>
+              <input type="range" id="cropZoom" min="100" max="300" value="100">
+              <div class="crop-actions">
+                <button class="btn-cancel" onclick="cancelCrop()">Annuler</button>
+                <button class="btn-ok" onclick="validerCrop()">Valider</button>
+              </div>
             </div>
           </div>
           <div class="field" style="max-width:300px">
@@ -337,6 +363,7 @@
 const DB_KEY = "zone13c_db_v1";
 const AGE_MIN = 13, AGE_MAX = 17, JOUEURS_MAX = 22;
 const SAISON_COURANTE = "2025-2026";
+const VALIDITE_LICENCE = "2026-2027"; // durée de validité : 2 ans
 
 function chargerDB(){
   let raw = localStorage.getItem(DB_KEY);
@@ -703,10 +730,115 @@ function previewPhoto(e){
   if(!file) return;
   const reader = new FileReader();
   reader.onload = function(ev){
-    photoTemp = ev.target.result;
-    document.getElementById('photoPreviewWrap').innerHTML = `<img src="${photoTemp}">`;
+    openCrop(ev.target.result);
   };
   reader.readAsDataURL(file);
+}
+
+/* ---- Rognage photo ---- */
+let cropState = {scale:1, minScale:1, x:0, y:0, natW:0, natH:0, dragging:false, sx:0, sy:0};
+const CROP_STAGE = 280, CROP_FRAME_W = 155, CROP_FRAME_H = 195;
+
+function openCrop(dataUrl){
+  const img = document.getElementById('cropImg');
+  img.onload = function(){
+    cropState.natW = img.naturalWidth;
+    cropState.natH = img.naturalHeight;
+    const minScale = Math.max(CROP_FRAME_W/cropState.natW, CROP_FRAME_H/cropState.natH);
+    cropState.minScale = minScale;
+    cropState.scale = minScale;
+    cropState.x = (CROP_STAGE - cropState.natW*minScale)/2;
+    cropState.y = (CROP_STAGE - cropState.natH*minScale)/2;
+    document.getElementById('cropZoom').value = 100;
+    applyCropTransform();
+  };
+  img.src = dataUrl;
+  document.getElementById('cropFrame').style.width = CROP_FRAME_W+'px';
+  document.getElementById('cropFrame').style.height = CROP_FRAME_H+'px';
+  document.getElementById('cropOverlay').classList.add('active');
+}
+
+function applyCropTransform(){
+  const img = document.getElementById('cropImg');
+  img.style.width = (cropState.natW*cropState.scale)+'px';
+  img.style.height = (cropState.natH*cropState.scale)+'px';
+  img.style.transform = `translate(${cropState.x}px, ${cropState.y}px)`;
+}
+
+function clampCropPos(){
+  const w = cropState.natW*cropState.scale, h = cropState.natH*cropState.scale;
+  const minX = CROP_STAGE - w, minY = CROP_STAGE - h;
+  cropState.x = Math.min(0, Math.max(minX, cropState.x));
+  cropState.y = Math.min(0, Math.max(minY, cropState.y));
+}
+
+(function initCropEvents(){
+  document.addEventListener('DOMContentLoaded', function(){
+    const stage = document.getElementById('cropStage');
+    const zoom = document.getElementById('cropZoom');
+    if(!stage) return;
+
+    function start(clientX, clientY){
+      cropState.dragging = true;
+      cropState.sx = clientX - cropState.x;
+      cropState.sy = clientY - cropState.y;
+    }
+    function move(clientX, clientY){
+      if(!cropState.dragging) return;
+      cropState.x = clientX - cropState.sx;
+      cropState.y = clientY - cropState.sy;
+      clampCropPos();
+      applyCropTransform();
+    }
+    function end(){ cropState.dragging = false; }
+
+    stage.addEventListener('mousedown', e=>start(e.clientX, e.clientY));
+    window.addEventListener('mousemove', e=>move(e.clientX, e.clientY));
+    window.addEventListener('mouseup', end);
+
+    stage.addEventListener('touchstart', e=>{
+      const t = e.touches[0]; start(t.clientX, t.clientY);
+    }, {passive:true});
+    stage.addEventListener('touchmove', e=>{
+      const t = e.touches[0]; move(t.clientX, t.clientY);
+    }, {passive:true});
+    stage.addEventListener('touchend', end);
+
+    zoom.addEventListener('input', function(){
+      const factor = this.value/100;
+      const cx = CROP_STAGE/2, cy = CROP_STAGE/2;
+      const oldScale = cropState.scale;
+      const newScale = cropState.minScale * factor;
+      cropState.x = cx - (cx - cropState.x) * (newScale/oldScale);
+      cropState.y = cy - (cy - cropState.y) * (newScale/oldScale);
+      cropState.scale = newScale;
+      clampCropPos();
+      applyCropTransform();
+    });
+  });
+})();
+
+function cancelCrop(){
+  document.getElementById('cropOverlay').classList.remove('active');
+  document.getElementById('jPhoto').value='';
+}
+
+function validerCrop(){
+  const canvas = document.createElement('canvas');
+  canvas.width = CROP_FRAME_W;
+  canvas.height = CROP_FRAME_H;
+  const ctx = canvas.getContext('2d');
+  const img = document.getElementById('cropImg');
+  const frameLeft = (CROP_STAGE - CROP_FRAME_W)/2;
+  const frameTop = (CROP_STAGE - CROP_FRAME_H)/2;
+  const sx = (frameLeft - cropState.x) / cropState.scale;
+  const sy = (frameTop - cropState.y) / cropState.scale;
+  const sw = CROP_FRAME_W / cropState.scale;
+  const sh = CROP_FRAME_H / cropState.scale;
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, CROP_FRAME_W, CROP_FRAME_H);
+  photoTemp = canvas.toDataURL('image/jpeg', 0.9);
+  document.getElementById('photoPreviewWrap').innerHTML = `<img src="${photoTemp}">`;
+  document.getElementById('cropOverlay').classList.remove('active');
 }
 function previewExtrait(e){
   const file = e.target.files[0];
@@ -728,6 +860,19 @@ function previewExtrait(e){
 /* =========================================================
    ENREGISTREMENT JOUEUR
    ========================================================= */
+function normaliserTexte(s){
+  return (s||'').trim().toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'') // enlève accents
+    .replace(/\s+/g,' ');
+}
+function cleJoueur(prenom, nom, ddn){
+  return normaliserTexte(prenom)+'|'+normaliserTexte(nom)+'|'+(ddn||'').trim();
+}
+function trouverDoublonJoueur(prenom, nom, ddn, idExclu){
+  const cle = cleJoueur(prenom, nom, ddn);
+  return DB.joueurs.find(j => j.id !== idExclu && cleJoueur(j.prenom, j.nom, j.date_naissance) === cle);
+}
+
 function enregistrerJoueur(){
   const msgBox = document.getElementById('joueurMsg');
   let ascId = parseInt(document.getElementById('jAsc').value);
@@ -749,8 +894,19 @@ function enregistrerJoueur(){
     msgBox.innerHTML = `<div class="alert err">Le joueur a ${age} ans. Catégorie Cadette : ${AGE_MIN} à ${AGE_MAX} ans.</div>`;
     return;
   }
+  if(!photoTemp){
+    msgBox.innerHTML = '<div class="alert err">La photo du joueur est obligatoire (garantie contre la fraude et la substitution d’identité).</div>';
+    return;
+  }
   if(!extraitTemp){
     msgBox.innerHTML = '<div class="alert err">L’extrait de naissance (PDF) est obligatoire pour confirmer la date de naissance déclarée.</div>';
+    return;
+  }
+  const doublon = trouverDoublonJoueur(prenom, nom, ddn, null);
+  if(doublon){
+    const ascExistante = DB.asc.find(a=>a.id===doublon.asc_id);
+    const nomAscExistante = ascExistante ? ascExistante.nom : 'une autre ASC';
+    msgBox.innerHTML = `<div class="alert err">⛔ Ce joueur est déjà enregistré (${doublon.prenom} ${doublon.nom}, né(e) le ${doublon.date_naissance}) sous l’ASC « ${nomAscExistante} ». Un joueur ne peut avoir qu’une seule licence, dans une seule ASC.</div>`;
     return;
   }
   const nbActuel = DB.joueurs.filter(j=>j.asc_id===ascId && j.saison===SAISON_COURANTE).length;
@@ -1021,7 +1177,8 @@ function dessinerLicenceSurCanvas(canvas, joueur, asc){
         ["EXTRAIT DE NAISSANCE", joueur.extrait_naissance ? "FOURNI ✓" : "—"],
         ["ASC", asc.nom.toUpperCase()],
         ["COULEURS", asc.couleurs || "—"],
-        ["ENTRAÎNEUR", ((asc.entraineur_prenom||'')+' '+(asc.entraineur_nom||'')).trim() || "—"]
+        ["ENTRAÎNEUR", ((asc.entraineur_prenom||'')+' '+(asc.entraineur_nom||'')).trim() || "—"],
+        ["VALIDITÉ LICENCE", `2 ANS · ${VALIDITE_LICENCE}`]
       ];
       ctx.textAlign='left';
       infos.forEach(([label,valeur])=>{
@@ -1047,6 +1204,8 @@ function dessinerLicenceSurCanvas(canvas, joueur, asc){
       ctx.fillText("N° LICENCE :", 30, H-60);
       ctx.font='bold 15px Arial'; ctx.fillStyle='#ffffff';
       ctx.fillText(joueur.numero_licence || "EN ATTENTE DE VALIDATION", 30, H-42);
+      ctx.font='11px Arial'; ctx.fillStyle='#cfe9d6';
+      ctx.fillText(`Licence valable 2 ans · ${VALIDITE_LICENCE}`, 30, H-26);
 
       // badge statut
       const bx=W-150, by=H-68;
