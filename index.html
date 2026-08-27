@@ -151,7 +151,11 @@
   <header>
     <div class="flag"><span style="background:#00853F"></span><span style="background:#FDEF42"></span><span style="background:#E31B23"></span></div>
     <h1>ZONE 13C NDIEMANE <small>ODCAV MBOUR · Championnats Nawétanes &amp; CNP — Gestion des Licences Joueurs</small></h1>
-    <div style="margin-left:auto;font-size:13px">👤 <b id="userLabel"></b> &nbsp; <button class="btn secondary" style="padding:6px 12px" onclick="deconnexion()">Déconnexion</button></div>
+    <div style="margin-left:auto;font-size:13px;display:flex;align-items:center;gap:10px">
+      <button class="btn" id="btnSync" style="padding:6px 12px" onclick="synchroniserManuellement()">🔄 Synchroniser</button>
+      <span id="syncStatus" style="font-size:11px;color:#555"></span>
+      👤 <b id="userLabel"></b> &nbsp; <button class="btn secondary" style="padding:6px 12px" onclick="deconnexion()">Déconnexion</button>
+    </div>
   </header>
 
   <nav>
@@ -352,30 +356,93 @@ function chargerDB(){
 let firestoreWriting = false;
 let firestoreLastJSON = null;
 
+/* ---------------------------------------------------------
+   FUSION DES DONNÉES (anti-écrasement)
+   BUG CORRIGÉ : l'ancienne synchronisation remplaçait TOUTE
+   la base par la dernière écriture reçue. Résultat : si
+   l'admin validait une licence pendant qu'un Secrétaire
+   Général enregistrait un joueur depuis une copie locale
+   plus ancienne, l'écriture du Secrétaire écrasait la
+   licence de l'admin (qui redevenait "en attente" et
+   disparaissait chez le Secrétaire). On fusionne maintenant
+   enregistrement par enregistrement, en gardant toujours la
+   version la plus récente (updated_at le plus grand).
+   --------------------------------------------------------- */
+function fusionnerListes(listeLocale, listeDistante, cleId){
+  const parId = new Map();
+  (listeDistante||[]).forEach(item => parId.set(item[cleId], item));
+  (listeLocale||[]).forEach(item => {
+    const existant = parId.get(item[cleId]);
+    if(!existant || (item.updated_at||0) >= (existant.updated_at||0)){
+      parId.set(item[cleId], item);
+    }
+  });
+  return Array.from(parId.values());
+}
+function fusionnerDB(local, distant){
+  if(!distant) return local;
+  if(!local) return distant;
+  return {
+    comptes: fusionnerListes(local.comptes, distant.comptes, 'login'),
+    asc: fusionnerListes(local.asc, distant.asc, 'id'),
+    joueurs: fusionnerListes(local.joueurs, distant.joueurs, 'id'),
+    nextAscId: Math.max(local.nextAscId||1, distant.nextAscId||1),
+    nextJoueurId: Math.max(local.nextJoueurId||1, distant.nextJoueurId||1)
+  };
+}
+
 function sauverDB(){
   localStorage.setItem(DB_KEY, JSON.stringify(DB));
   syncVersFirestore();
 }
 
-function syncVersFirestore(){
-  if(!window.FB) return; // Firebase pas encore prêt
-  const json = JSON.stringify(DB);
-  if(json === firestoreLastJSON) return;
-  firestoreLastJSON = json;
-  firestoreWriting = true;
-  window.FB.setDoc(window.FB.docRef, { data: json, updatedAt: Date.now() })
-    .catch(e => console.error("Sync Firestore (écriture) échouée :", e))
-    .finally(() => { firestoreWriting = false; });
+function majStatutSync(texte){
+  const el = document.getElementById('syncStatus');
+  if(el) el.textContent = texte;
 }
+
+async function syncVersFirestore(){
+  if(!window.FB) return; // Firebase pas encore prêt
+  firestoreWriting = true;
+  majStatutSync('Synchronisation…');
+  try{
+    // On relit toujours la version distante la plus fraîche et on FUSIONNE
+    // avant d'écrire, au lieu d'écraser aveuglément.
+    const snap = await window.FB.getDoc(window.FB.docRef);
+    const distant = (snap.exists() && snap.data().data) ? JSON.parse(snap.data().data) : null;
+    const fusion = fusionnerDB(DB, distant);
+    DB = fusion;
+    const json = JSON.stringify(DB);
+    localStorage.setItem(DB_KEY, json);
+    if(json !== firestoreLastJSON){
+      firestoreLastJSON = json;
+      await window.FB.setDoc(window.FB.docRef, { data: json, updatedAt: Date.now() });
+    }
+    majStatutSync('Synchronisé ✓');
+  }catch(e){
+    console.error("Sync Firestore (écriture) échouée :", e);
+    majStatutSync('Échec de synchronisation');
+  }finally{
+    firestoreWriting = false;
+  }
+}
+
+async function synchroniserManuellement(){
+  if(!window.FB){ majStatutSync('Firebase non disponible'); return; }
+  await syncVersFirestore();
+  if(utilisateurCourant) rafraichirTout();
+}
+window.synchroniserManuellement = synchroniserManuellement;
 
 async function initFirebaseSync(){
   if(!window.FB) return;
   try{
     const snap = await window.FB.getDoc(window.FB.docRef);
     if(snap.exists() && snap.data().data){
-      DB = JSON.parse(snap.data().data);
-      firestoreLastJSON = snap.data().data;
-      localStorage.setItem(DB_KEY, JSON.stringify(DB));
+      const distant = JSON.parse(snap.data().data);
+      DB = fusionnerDB(DB, distant);
+      firestoreLastJSON = JSON.stringify(DB);
+      localStorage.setItem(DB_KEY, firestoreLastJSON);
     } else {
       // Aucune donnée distante : on envoie la base locale comme point de départ
       syncVersFirestore();
@@ -389,8 +456,9 @@ async function initFirebaseSync(){
     const remote = snap.data();
     if(!remote || !remote.data || remote.data === firestoreLastJSON) return;
     firestoreLastJSON = remote.data;
-    DB = JSON.parse(remote.data);
+    DB = fusionnerDB(DB, JSON.parse(remote.data));
     localStorage.setItem(DB_KEY, JSON.stringify(DB));
+    majStatutSync('Mis à jour ✓');
     if(utilisateurCourant) rafraichirTout();
   }, (err) => console.error("Sync Firestore (écoute) échouée :", err));
   if(utilisateurCourant) rafraichirTout();
@@ -473,9 +541,9 @@ function creerCompteAsc(){
     return;
   }
 
-  const asc = {id:DB.nextAscId++, nom:ascNom, couleurs, entraineur_prenom:entP, entraineur_nom:entN, actif:1};
+  const asc = {id:DB.nextAscId++, nom:ascNom, couleurs, entraineur_prenom:entP, entraineur_nom:entN, actif:1, updated_at:Date.now()};
   DB.asc.push(asc);
-  DB.comptes.push({login, pwd, role:"secretaire", asc_id: asc.id});
+  DB.comptes.push({login, pwd, role:"secretaire", asc_id: asc.id, updated_at:Date.now()});
   sauverDB();
 
   // Connexion automatique du nouveau Secrétaire Général
@@ -702,7 +770,8 @@ function enregistrerJoueur(){
     saison: SAISON_COURANTE,
     categorie: "CADET",
     statut: "en_attente",
-    numero_licence: null
+    numero_licence: null,
+    updated_at: Date.now()
   };
   DB.joueurs.push(joueur);
   sauverDB();
@@ -816,6 +885,7 @@ function enregistrerMonAsc(){
   asc.couleurs = document.getElementById('maAscCouleurs').value.trim();
   asc.entraineur_prenom = document.getElementById('maAscEntPrenom').value.trim();
   asc.entraineur_nom = document.getElementById('maAscEntNom').value.trim();
+  asc.updated_at = Date.now();
   sauverDB();
   msgBox.innerHTML = '<div class="alert ok">✅ Informations de l’ASC mises à jour.</div>';
   afficherAscTable();
@@ -1050,6 +1120,7 @@ function validerJoueurCourant(){
     joueur.numero_licence = genererNumeroLicence(joueur.asc_id, joueur.id);
   }
   joueur.statut = 'valide';
+  joueur.updated_at = Date.now();
   sauverDB();
   afficherListeJoueurs(); rafraichirStats(); genererApercu();
 }
