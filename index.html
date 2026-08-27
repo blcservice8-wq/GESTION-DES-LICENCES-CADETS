@@ -73,10 +73,12 @@
   .crop-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:9999;align-items:center;justify-content:center;}
   .crop-overlay.active{display:flex;}
   .crop-box{background:#fff;border-radius:10px;padding:18px;width:92%;max-width:420px;text-align:center;}
-  .crop-box h3{margin:0 0 12px;font-size:15px;color:var(--vert-foot);}
-  .crop-stage{position:relative;width:280px;height:280px;margin:0 auto;overflow:hidden;background:#222;border-radius:6px;touch-action:none;}
-  .crop-stage img{position:absolute;left:0;top:0;user-select:none;-webkit-user-drag:none;cursor:grab;}
-  .crop-frame{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);border:2px solid var(--jaune);box-shadow:0 0 0 2000px rgba(0,0,0,.5);pointer-events:none;}
+  .crop-box h3{margin:0 0 4px;font-size:15px;color:var(--vert-foot);}
+  .crop-box .crop-hint{font-size:11px;color:#777;margin:0 0 12px;}
+  .crop-stage{position:relative;width:300px;height:300px;margin:0 auto;overflow:hidden;background:#222;border-radius:6px;touch-action:none;}
+  .crop-stage img{position:absolute;user-select:none;-webkit-user-drag:none;pointer-events:none;}
+  .crop-frame{position:absolute;border:2px solid var(--jaune);box-shadow:0 0 0 2000px rgba(0,0,0,.55);cursor:move;}
+  .crop-handle{position:absolute;right:-9px;bottom:-9px;width:20px;height:20px;background:var(--jaune);border:2px solid #fff;border-radius:50%;cursor:nwse-resize;box-shadow:0 1px 3px rgba(0,0,0,.4);}
   .crop-box input[type=range]{width:100%;margin:12px 0;}
   .crop-actions{display:flex;gap:10px;justify-content:center;margin-top:10px;}
   .crop-actions button{padding:9px 18px;border:none;border-radius:6px;font-size:13px;cursor:pointer;}
@@ -271,9 +273,12 @@
           <div class="crop-overlay" id="cropOverlay">
             <div class="crop-box">
               <h3>Rogner la photo</h3>
+              <p class="crop-hint">Déplacez le cadre, tirez le point jaune pour redimensionner</p>
               <div class="crop-stage" id="cropStage">
                 <img id="cropImg" src="">
-                <div class="crop-frame" id="cropFrame"></div>
+                <div class="crop-frame" id="cropFrame">
+                  <div class="crop-handle" id="cropHandle"></div>
+                </div>
               </div>
               <input type="range" id="cropZoom" min="100" max="300" value="100">
               <div class="crop-actions">
@@ -735,85 +740,134 @@ function previewPhoto(e){
   reader.readAsDataURL(file);
 }
 
-/* ---- Rognage photo ---- */
-let cropState = {scale:1, minScale:1, x:0, y:0, natW:0, natH:0, dragging:false, sx:0, sy:0};
-const CROP_STAGE = 280, CROP_FRAME_W = 155, CROP_FRAME_H = 195;
+/* ---- Rognage manuel photo ---- */
+const CROP_STAGE = 300;                 // taille de la zone d'aperçu (px)
+const CROP_RATIO = 155/195;             // ratio final de la photo licence
+let cropState = {
+  natW:0, natH:0,          // taille réelle de l'image
+  containScale:1,          // échelle "image entière visible"
+  zoom:1,                  // facteur de zoom additionnel (slider)
+  imgLeft:0, imgTop:0, dispW:0, dispH:0,  // rectangle affiché de l'image dans la zone
+  frame:{x:0,y:0,w:0,h:0}, // cadre de rognage (coordonnées dans la zone)
+  mode:null,                // 'move' | 'resize' | null
+  sx:0, sy:0, startFrame:null
+};
 
 function openCrop(dataUrl){
   const img = document.getElementById('cropImg');
   img.onload = function(){
     cropState.natW = img.naturalWidth;
     cropState.natH = img.naturalHeight;
-    const minScale = Math.max(CROP_FRAME_W/cropState.natW, CROP_FRAME_H/cropState.natH);
-    cropState.minScale = minScale;
-    cropState.scale = minScale;
-    cropState.x = (CROP_STAGE - cropState.natW*minScale)/2;
-    cropState.y = (CROP_STAGE - cropState.natH*minScale)/2;
+    cropState.containScale = Math.min(CROP_STAGE/cropState.natW, CROP_STAGE/cropState.natH);
+    cropState.zoom = 1;
     document.getElementById('cropZoom').value = 100;
-    applyCropTransform();
+    majImageAffichee();
+    // Cadre initial : centré, le plus grand possible dans l'image visible, ratio licence
+    let fh = cropState.dispH * 0.92;
+    let fw = fh * CROP_RATIO;
+    if(fw > cropState.dispW * 0.92){ fw = cropState.dispW * 0.92; fh = fw / CROP_RATIO; }
+    cropState.frame.w = fw;
+    cropState.frame.h = fh;
+    cropState.frame.x = cropState.imgLeft + (cropState.dispW - fw)/2;
+    cropState.frame.y = cropState.imgTop + (cropState.dispH - fh)/2;
+    clampFrame();
+    dessinerCrop();
   };
   img.src = dataUrl;
-  document.getElementById('cropFrame').style.width = CROP_FRAME_W+'px';
-  document.getElementById('cropFrame').style.height = CROP_FRAME_H+'px';
   document.getElementById('cropOverlay').classList.add('active');
 }
 
-function applyCropTransform(){
+function majImageAffichee(){
   const img = document.getElementById('cropImg');
-  img.style.width = (cropState.natW*cropState.scale)+'px';
-  img.style.height = (cropState.natH*cropState.scale)+'px';
-  img.style.transform = `translate(${cropState.x}px, ${cropState.y}px)`;
+  const scale = cropState.containScale * cropState.zoom;
+  cropState.dispW = cropState.natW * scale;
+  cropState.dispH = cropState.natH * scale;
+  cropState.imgLeft = (CROP_STAGE - cropState.dispW)/2;
+  cropState.imgTop = (CROP_STAGE - cropState.dispH)/2;
+  img.style.left = cropState.imgLeft+'px';
+  img.style.top = cropState.imgTop+'px';
+  img.style.width = cropState.dispW+'px';
+  img.style.height = cropState.dispH+'px';
 }
 
-function clampCropPos(){
-  const w = cropState.natW*cropState.scale, h = cropState.natH*cropState.scale;
-  const minX = CROP_STAGE - w, minY = CROP_STAGE - h;
-  cropState.x = Math.min(0, Math.max(minX, cropState.x));
-  cropState.y = Math.min(0, Math.max(minY, cropState.y));
+function limitesImage(){
+  // zone visible de l'image, bornée par la zone d'aperçu
+  return {
+    minX: Math.max(0, cropState.imgLeft),
+    maxX: Math.min(CROP_STAGE, cropState.imgLeft + cropState.dispW),
+    minY: Math.max(0, cropState.imgTop),
+    maxY: Math.min(CROP_STAGE, cropState.imgTop + cropState.dispH)
+  };
+}
+
+function clampFrame(){
+  const lim = limitesImage();
+  const maxW = Math.max(20, lim.maxX - lim.minX);
+  const maxH = Math.max(20, lim.maxY - lim.minY);
+  // respecte le ratio en réduisant si nécessaire
+  if(cropState.frame.w > maxW){ cropState.frame.w = maxW; cropState.frame.h = cropState.frame.w / CROP_RATIO; }
+  if(cropState.frame.h > maxH){ cropState.frame.h = maxH; cropState.frame.w = cropState.frame.h * CROP_RATIO; }
+  cropState.frame.w = Math.max(40, cropState.frame.w);
+  cropState.frame.h = Math.max(40/CROP_RATIO, cropState.frame.h);
+  const maxX = lim.maxX - cropState.frame.w, maxY = lim.maxY - cropState.frame.h;
+  cropState.frame.x = Math.min(maxX, Math.max(lim.minX, cropState.frame.x));
+  cropState.frame.y = Math.min(maxY, Math.max(lim.minY, cropState.frame.y));
+}
+
+function dessinerCrop(){
+  const f = document.getElementById('cropFrame');
+  f.style.left = cropState.frame.x+'px';
+  f.style.top = cropState.frame.y+'px';
+  f.style.width = cropState.frame.w+'px';
+  f.style.height = cropState.frame.h+'px';
 }
 
 (function initCropEvents(){
   document.addEventListener('DOMContentLoaded', function(){
     const stage = document.getElementById('cropStage');
+    const frameEl = document.getElementById('cropFrame');
+    const handleEl = document.getElementById('cropHandle');
     const zoom = document.getElementById('cropZoom');
     if(!stage) return;
 
-    function start(clientX, clientY){
-      cropState.dragging = true;
-      cropState.sx = clientX - cropState.x;
-      cropState.sy = clientY - cropState.y;
+    function debut(clientX, clientY, mode){
+      cropState.mode = mode;
+      cropState.sx = clientX;
+      cropState.sy = clientY;
+      cropState.startFrame = {...cropState.frame};
     }
-    function move(clientX, clientY){
-      if(!cropState.dragging) return;
-      cropState.x = clientX - cropState.sx;
-      cropState.y = clientY - cropState.sy;
-      clampCropPos();
-      applyCropTransform();
+    function deplacer(clientX, clientY){
+      if(!cropState.mode) return;
+      const dx = clientX - cropState.sx, dy = clientY - cropState.sy;
+      if(cropState.mode === 'move'){
+        cropState.frame.x = cropState.startFrame.x + dx;
+        cropState.frame.y = cropState.startFrame.y + dy;
+      } else if(cropState.mode === 'resize'){
+        let newW = cropState.startFrame.w + dx;
+        newW = Math.max(40, newW);
+        cropState.frame.w = newW;
+        cropState.frame.h = newW / CROP_RATIO;
+      }
+      clampFrame();
+      dessinerCrop();
     }
-    function end(){ cropState.dragging = false; }
+    function fin(){ cropState.mode = null; }
 
-    stage.addEventListener('mousedown', e=>start(e.clientX, e.clientY));
-    window.addEventListener('mousemove', e=>move(e.clientX, e.clientY));
-    window.addEventListener('mouseup', end);
+    frameEl.addEventListener('mousedown', e=>{ e.stopPropagation(); debut(e.clientX, e.clientY, 'move'); });
+    handleEl.addEventListener('mousedown', e=>{ e.stopPropagation(); debut(e.clientX, e.clientY, 'resize'); });
+    window.addEventListener('mousemove', e=>deplacer(e.clientX, e.clientY));
+    window.addEventListener('mouseup', fin);
 
-    stage.addEventListener('touchstart', e=>{
-      const t = e.touches[0]; start(t.clientX, t.clientY);
-    }, {passive:true});
-    stage.addEventListener('touchmove', e=>{
-      const t = e.touches[0]; move(t.clientX, t.clientY);
-    }, {passive:true});
-    stage.addEventListener('touchend', end);
+    frameEl.addEventListener('touchstart', e=>{ e.stopPropagation(); const t=e.touches[0]; debut(t.clientX, t.clientY, 'move'); }, {passive:true});
+    handleEl.addEventListener('touchstart', e=>{ e.stopPropagation(); const t=e.touches[0]; debut(t.clientX, t.clientY, 'resize'); }, {passive:true});
+    window.addEventListener('touchmove', e=>{ if(!cropState.mode) return; const t=e.touches[0]; deplacer(t.clientX, t.clientY); }, {passive:true});
+    window.addEventListener('touchend', fin);
 
     zoom.addEventListener('input', function(){
-      const factor = this.value/100;
-      const cx = CROP_STAGE/2, cy = CROP_STAGE/2;
-      const oldScale = cropState.scale;
-      const newScale = cropState.minScale * factor;
-      cropState.x = cx - (cx - cropState.x) * (newScale/oldScale);
-      cropState.y = cy - (cy - cropState.y) * (newScale/oldScale);
-      cropState.scale = newScale;
-      clampCropPos();
-      applyCropTransform();
+      cropState.zoom = this.value/100;
+      majImageAffichee();
+      clampFrame();
+      dessinerCrop();
     });
   });
 })();
@@ -824,19 +878,19 @@ function cancelCrop(){
 }
 
 function validerCrop(){
+  const OUT_W = 310, OUT_H = 390; // export en meilleure résolution, même ratio
   const canvas = document.createElement('canvas');
-  canvas.width = CROP_FRAME_W;
-  canvas.height = CROP_FRAME_H;
+  canvas.width = OUT_W;
+  canvas.height = OUT_H;
   const ctx = canvas.getContext('2d');
   const img = document.getElementById('cropImg');
-  const frameLeft = (CROP_STAGE - CROP_FRAME_W)/2;
-  const frameTop = (CROP_STAGE - CROP_FRAME_H)/2;
-  const sx = (frameLeft - cropState.x) / cropState.scale;
-  const sy = (frameTop - cropState.y) / cropState.scale;
-  const sw = CROP_FRAME_W / cropState.scale;
-  const sh = CROP_FRAME_H / cropState.scale;
-  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, CROP_FRAME_W, CROP_FRAME_H);
-  photoTemp = canvas.toDataURL('image/jpeg', 0.9);
+  const scale = cropState.containScale * cropState.zoom;
+  const sx = (cropState.frame.x - cropState.imgLeft) / scale;
+  const sy = (cropState.frame.y - cropState.imgTop) / scale;
+  const sw = cropState.frame.w / scale;
+  const sh = cropState.frame.h / scale;
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, OUT_W, OUT_H);
+  photoTemp = canvas.toDataURL('image/jpeg', 0.92);
   document.getElementById('photoPreviewWrap').innerHTML = `<img src="${photoTemp}">`;
   document.getElementById('cropOverlay').classList.remove('active');
 }
