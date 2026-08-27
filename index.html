@@ -498,6 +498,11 @@ async function initFirebaseSync(){
 window.initFirebaseSync = initFirebaseSync;
 
 let DB = chargerDB();
+
+/* ID unique anti-collision (corrige les pertes de données en sync multi-appareils) */
+function genererIdUnique(){
+  return Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+}
 let utilisateurCourant = null;
 let photoTemp = null; // dataURL temporaire pour le formulaire joueur
 let extraitTemp = null; // dataURL temporaire (PDF) de l'extrait de naissance
@@ -573,7 +578,7 @@ function creerCompteAsc(){
     return;
   }
 
-  const asc = {id:DB.nextAscId++, nom:ascNom, couleurs, entraineur_prenom:entP, entraineur_nom:entN, actif:1, updated_at:Date.now()};
+  const asc = {id:genererIdUnique(), nom:ascNom, couleurs, entraineur_prenom:entP, entraineur_nom:entN, actif:1, updated_at:Date.now()};
   DB.asc.push(asc);
   DB.comptes.push({login, pwd, role:"secretaire", asc_id: asc.id, updated_at:Date.now()});
   sauverDB();
@@ -674,7 +679,7 @@ function ajouterAsc(){
     msgBox.innerHTML = '<div class="alert err">Cette ASC existe déjà.</div>';
     return;
   }
-  DB.asc.push({id:DB.nextAscId++, nom, couleurs, entraineur_prenom:entP, entraineur_nom:entN, actif:1});
+  DB.asc.push({id:genererIdUnique(), nom, couleurs, entraineur_prenom:entP, entraineur_nom:entN, actif:1, updated_at:Date.now()});
   sauverDB();
   msgBox.innerHTML = '<div class="alert ok">✅ ASC « '+nom+' » ajoutée avec succès.</div>';
   document.getElementById('ascNom').value='';
@@ -970,7 +975,7 @@ function enregistrerJoueur(){
   }
 
   const joueur = {
-    id: DB.nextJoueurId++,
+    id: genererIdUnique(),
     asc_id: ascId,
     prenom, nom,
     date_naissance: ddn,
