@@ -1444,7 +1444,7 @@ function telechargerHistorique(id){
 /* Génère l'image finale de la licence, l'archive dans l'historique,
    puis supprime les fichiers bruts (photo + extrait) du stockage —
    c'est ce qui réduit le volume de fichiers conservés. */
-async function archiverLicence(joueur){
+async function archiverLicence(joueur, noSave){
   if(!window.FB || !window.FB.uploadDataUrl) return;
   const asc = ascActifs().find(a=>a.id===joueur.asc_id) || {nom:'—'};
   const canvasTmp = document.createElement('canvas');
@@ -1479,8 +1479,10 @@ async function archiverLicence(joueur){
     joueur.extrait_naissance = null;
     joueur.extrait_chemin = null;
     joueur.updated_at = Date.now();
-    sauverDB();
-    afficherListeJoueurs();
+    if(!noSave){
+      sauverDB();
+      afficherListeJoueurs();
+    }
   }catch(e){
     console.error("Archivage de la licence échoué :", e);
     majStatutSync('Échec archivage licence');
@@ -1544,16 +1546,59 @@ function importerDonnees(e){
   const file = e.target.files[0];
   if(!file) return;
   const reader = new FileReader();
-  reader.onload = function(ev){
+  reader.onload = async function(ev){
     try{
       const data = JSON.parse(ev.target.result);
       if(!data.asc || !data.joueurs || !data.comptes){ throw new Error("format invalide"); }
       if(!data.historique) data.historique = []; // compatibilité anciennes sauvegardes
-      DB = data;
+
+      /* MIGRATION : les anciennes sauvegardes stockent la photo et
+         l'extrait de naissance en base64 directement dans le JSON
+         (c'est ce qui dépassait la limite de 1 Mo par document
+         Firestore). On les envoie vers Firebase Storage avant
+         d'importer — comme pour un nouvel enregistrement — et on
+         archive directement les licences déjà validées, exactement
+         comme le fait la validation normale. */
+      const brut = j => j && typeof j === 'string' && j.startsWith('data:');
+      const joueursBruts = data.joueurs.filter(j => brut(j.photo) || brut(j.extrait_naissance));
+
+      if(joueursBruts.length){
+        if(!window.FB || !window.FB.uploadDataUrl){
+          alert("Connexion au serveur non prête. Réessayez dans quelques secondes.");
+          e.target.value='';
+          return;
+        }
+        DB = data; // nécessaire pour que ascActifs()/DB.asc soient corrects pendant la migration
+        for(let i=0;i<joueursBruts.length;i++){
+          const j = joueursBruts[i];
+          majStatutSync(`Migration des fichiers… (${i+1}/${joueursBruts.length})`);
+          if(j.statut === 'valide' && j.numero_licence){
+            // Déjà validé : on archive directement la carte finale
+            // (elle contient la photo) et on jette le brut.
+            await archiverLicence(j, true);
+          } else {
+            if(brut(j.photo)){
+              const chemin = `joueurs/${j.id}/photo.jpg`;
+              j.photo = await window.FB.uploadDataUrl(chemin, j.photo);
+              j.photo_chemin = chemin;
+            }
+            if(brut(j.extrait_naissance)){
+              const chemin = `joueurs/${j.id}/extrait`;
+              j.extrait_naissance = await window.FB.uploadDataUrl(chemin, j.extrait_naissance);
+              j.extrait_chemin = chemin;
+            }
+          }
+        }
+      } else {
+        DB = data;
+      }
+
       sauverDB();
       rafraichirTout();
-      alert("✅ Données importées avec succès.");
+      majStatutSync('Synchronisé ✓');
+      alert(`✅ Données importées avec succès${joueursBruts.length ? ' (' + joueursBruts.length + ' dossier(s) migré(s) vers le stockage distant).' : '.'}`);
     }catch(err){
+      console.error(err);
       alert("❌ Fichier invalide : " + err.message);
     }
   };
