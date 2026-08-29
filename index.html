@@ -1351,7 +1351,7 @@ function trouverDoublonJoueur(prenom, nom, ddn, idExclu){
 
 function enregistrerJoueur(){
   const msgBox = document.getElementById('joueurMsg');
-  let ascId = parseInt(document.getElementById('jAsc').value);
+  let ascId = document.getElementById('jAsc').value;
   if(estSecretaire()) ascId = monAscId();
   const prenom = document.getElementById('jPrenom').value.trim();
   const nom = document.getElementById('jNom').value.trim().toUpperCase();
@@ -1457,7 +1457,7 @@ function afficherListeJoueurs(){
   const filtre = document.getElementById('filterAsc').value;
   let liste = DB.joueurs;
   if(estSecretaire()) liste = liste.filter(j=>j.asc_id===monAscId());
-  else if(filtre) liste = liste.filter(j=>j.asc_id===parseInt(filtre));
+  else if(filtre) liste = liste.filter(j=>j.asc_id===filtre);
   liste.forEach(j=>{
     const asc = DB.asc.find(a=>a.id===j.asc_id) || {nom:'?'};
     const badgeClass = j.statut==='valide'?'valide':(j.statut==='rejete'?'rejete':'attente');
@@ -1520,7 +1520,7 @@ function afficherHistorique(){
   tb.innerHTML = '';
   const filtre = selectFiltre ? selectFiltre.value : '';
   let liste = DB.joueurs.filter(j=>j.numero_licence || j.date_generation);
-  if(filtre) liste = liste.filter(j=>j.asc_id===parseInt(filtre));
+  if(filtre) liste = liste.filter(j=>j.asc_id===filtre);
   liste = liste.slice().sort((a,b)=>(b.date_generation||0)-(a.date_generation||0));
   if(liste.length===0){
     tb.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#888">Aucune licence générée pour le moment.</td></tr>';
@@ -1829,7 +1829,7 @@ function roundRect(ctx,x,y,w,h,r){
 }
 
 function genererApercu(){
-  const id = parseInt(document.getElementById('licenceJoueur').value);
+  const id = document.getElementById('licenceJoueur').value;
   const joueur = DB.joueurs.find(j=>j.id===id);
   if(!joueur) return;
   const asc = DB.asc.find(a=>a.id===joueur.asc_id) || {nom:'—'};
@@ -1837,7 +1837,7 @@ function genererApercu(){
 }
 
 function validerJoueurCourant(){
-  const id = parseInt(document.getElementById('licenceJoueur').value);
+  const id = document.getElementById('licenceJoueur').value;
   const joueur = DB.joueurs.find(j=>j.id===id);
   if(!joueur) return;
   if(!joueur.numero_licence){
@@ -1941,7 +1941,7 @@ function purgerJoueurUnique(id){
 window.purgerJoueurUnique = purgerJoueurUnique;
 
 function telechargerLicence(){
-  const id = parseInt(document.getElementById('licenceJoueur').value);
+  const id = document.getElementById('licenceJoueur').value;
   const joueur = DB.joueurs.find(j=>j.id===id);
   if(!joueur){ alert("Choisissez un joueur."); return; }
   if(!joueur.date_generation){
