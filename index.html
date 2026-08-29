@@ -179,6 +179,7 @@
     <button class="navbtn" data-panel="joueur" onclick="showPanel('joueur')">📝 Enregistrer un joueur</button>
     <button class="navbtn" data-panel="liste" onclick="showPanel('liste')">📋 Liste des joueurs</button>
     <button class="navbtn admin-only" data-panel="licence" onclick="showPanel('licence')">🪪 Générer la licence</button>
+    <button class="navbtn admin-only" data-panel="historique" onclick="showPanel('historique')">🕘 Historique des licences</button>
     <button class="navbtn admin-only" data-panel="comptes" onclick="showPanel('comptes')">👥 Comptes</button>
   </nav>
 
@@ -190,6 +191,7 @@
         <div class="stat-box"><div class="num" id="statAsc">0</div><div class="lbl">Associations actives</div></div>
         <div class="stat-box"><div class="num" id="statJoueurs">0</div><div class="lbl">Joueurs enregistrés</div></div>
         <div class="stat-box"><div class="num" id="statValides">0</div><div class="lbl">Licences validées</div></div>
+        <div class="stat-box"><div class="num" id="statPrete">0</div><div class="lbl">Prêtes à l'impression</div></div>
         <div class="stat-box"><div class="num" id="statAttente">0</div><div class="lbl">En attente</div></div>
       </div>
       <div class="card">
@@ -342,6 +344,26 @@
       </div>
     </div>
 
+    <!-- ============ HISTORIQUE DES LICENCES ============ -->
+    <div class="panel" id="panel-historique">
+      <div class="card">
+        <h2>Historique des licences</h2>
+        <p style="font-size:13px;color:#555;margin-bottom:10px">
+          Suivi des licences <b>générées</b>, <b>validées</b> et <b>prêtes à l'impression</b>.
+        </p>
+        <div class="field" style="max-width:300px"><label>Filtrer par ASC</label>
+          <select id="filterAscHistorique" onchange="afficherHistorique()"><option value="">Toutes les ASC</option></select>
+        </div>
+        <table>
+          <thead><tr>
+            <th>Joueur</th><th>ASC</th><th>N° Licence</th>
+            <th>Générée le</th><th>Validée le</th><th>Prête à l'impression</th><th>Actions</th>
+          </tr></thead>
+          <tbody id="historiqueTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- ============ COMPTES (Admin) ============ -->
     <div class="panel" id="panel-comptes">
       <div class="card">
@@ -408,11 +430,20 @@ function majStatutSync(texte){
    entier : deux téléphones qui sauvegardaient à quelques secondes
    d'intervalle pouvaient se marcher dessus.
 
-   Solution : chaque ASC et chaque joueur est maintenant son
-   PROPRE document Firestore (collections "zone13c_asc" et
-   "zone13c_joueurs"). Un compte (avec sa photo/PDF) ne dépasse
-   plus jamais la limite, et deux appareils qui modifient deux
-   joueurs différents en même temps ne se gênent plus.
+   Solution (étape 1) : chaque ASC et chaque joueur est son PROPRE
+   document Firestore (collections "zone13c_asc" et "zone13c_joueurs").
+
+   Solution (étape 2) : même avec un document par joueur, la photo
+   ET l'extrait de naissance compressés pouvaient ENSEMBLE dépasser
+   1 Mo. Chaque joueur est donc désormais éclaté en TROIS documents
+   Firestore distincts :
+     - "zone13c_joueurs"          → métadonnées seules (léger)
+     - "zone13c_joueurs_photos"   → uniquement la photo
+     - "zone13c_joueurs_extraits" → uniquement l'extrait de naissance
+   Les trois partagent le même identifiant que le joueur. Localement
+   (localStorage), l'objet joueur reste unique et complet ; seul
+   l'envoi vers Firestore est fractionné.
+
    On garde aussi une file d'attente locale : si le téléphone est
    hors-ligne, les modifications restent en attente et repartent
    automatiquement dès le retour du réseau.
@@ -422,6 +453,16 @@ let filePendingJoueurs = new Set();
 let filePendingComptes = false;
 let syncEnCours = false;
 let syncEcouteursInitialises = false;
+// Si la photo ou l'extrait d'un joueur arrive (autre appareil) avant sa
+// fiche de métadonnées, on la garde en attente le temps que la fiche arrive.
+let joueursPhotosEnAttente = new Map();
+let joueursExtraitsEnAttente = new Map();
+
+/* Champs de métadonnées envoyés dans "zone13c_joueurs" (sans photo/extrait) */
+function metaJoueur(j){
+  const { photo, photo_updated_at, extrait_naissance, extrait_naissance_nom, extrait_updated_at, ...meta } = j;
+  return meta;
+}
 
 function sauverDB(opts){
   sauverLocal();
@@ -438,6 +479,17 @@ function sauverDB(opts){
   lancerSync();
 }
 
+/* Un document Firestore refusé pour cause de taille (> 1 Mo) contenait
+   auparavant TOUT le monde dans un seul batch : un seul joueur avec un
+   gros PDF bloquait la synchronisation de toute l'application, pour
+   toujours (la file n'était jamais vidée). Désormais chaque document
+   (métadonnées, photo, extrait) est envoyé séparément : un échec isolé
+   ne bloque plus les autres, et un document définitivement trop gros
+   est écarté au lieu de boucler indéfiniment. */
+function estErreurTailleDocument(err){
+  return !!err && (err.code === 'invalid-argument' || /longer than|exceeds|too large|maximum size/i.test(err.message||''));
+}
+
 async function lancerSync(){
   if(!window.FB) return;
   if(syncEnCours) return;
@@ -448,34 +500,96 @@ async function lancerSync(){
   const ascAEnvoyer = Array.from(filePendingAsc);
   const joueursAEnvoyer = Array.from(filePendingJoueurs);
   const comptesAEnvoyer = filePendingComptes;
+  const echecsTaille = [];
+  const echecsReseau = [];
+
   try{
-    const batch = window.FB.batch();
-    let n = 0;
+    const taches = [];
+
     ascAEnvoyer.forEach(id=>{
       const a = DB.asc.find(x=>x.id===id);
       const ref = window.FB.doc(window.FB.ascCol, String(id));
-      if(a) batch.set(ref, a); else batch.delete(ref);
-      n++;
+      const p = (a ? window.FB.setDoc(ref, a) : window.FB.deleteDoc(ref))
+        .then(()=>{ filePendingAsc.delete(id); })
+        .catch(err=>{
+          if(estErreurTailleDocument(err)){ filePendingAsc.delete(id); echecsTaille.push({type:'ASC', id, err}); }
+          else echecsReseau.push({type:'ASC', id, err});
+        });
+      taches.push(p);
     });
+
+    // Chaque joueur = jusqu'à 3 écritures indépendantes (méta / photo / extrait).
+    // On ne retire le joueur de la file que si les 3 sous-écritures réussissent
+    // (ou échouent uniquement pour cause de taille, auquel cas on les écarte
+    // individuellement sans bloquer les 2 autres parties).
     joueursAEnvoyer.forEach(id=>{
       const j = DB.joueurs.find(x=>x.id===id);
-      const ref = window.FB.doc(window.FB.joueursCol, String(id));
-      if(j) batch.set(ref, j); else batch.delete(ref);
-      n++;
+      const refMeta = window.FB.doc(window.FB.joueursCol, String(id));
+      const refPhoto = window.FB.doc(window.FB.joueursPhotosCol, String(id));
+      const refExtrait = window.FB.doc(window.FB.joueursExtraitsCol, String(id));
+
+      const sousTaches = [];
+
+      sousTaches.push(
+        (j ? window.FB.setDoc(refMeta, metaJoueur(j)) : window.FB.deleteDoc(refMeta))
+          .catch(err=>{
+            echecsReseau.push({type:'joueur (métadonnées)', id, err});
+          })
+      );
+      sousTaches.push(
+        (j && j.photo
+          ? window.FB.setDoc(refPhoto, { photo: j.photo, updated_at: j.photo_updated_at || j.updated_at })
+          : window.FB.deleteDoc(refPhoto))
+          .catch(err=>{
+            if(estErreurTailleDocument(err)){ echecsTaille.push({type:'photo', id, err}); }
+            else echecsReseau.push({type:'joueur (photo)', id, err});
+          })
+      );
+      sousTaches.push(
+        (j && j.extrait_naissance
+          ? window.FB.setDoc(refExtrait, { extrait_naissance: j.extrait_naissance, extrait_naissance_nom: j.extrait_naissance_nom, updated_at: j.extrait_updated_at || j.updated_at })
+          : window.FB.deleteDoc(refExtrait))
+          .catch(err=>{
+            if(estErreurTailleDocument(err)){ echecsTaille.push({type:'extrait', id, err}); }
+            else echecsReseau.push({type:'joueur (extrait)', id, err});
+          })
+      );
+
+      const p = Promise.allSettled(sousTaches).then(()=>{
+        // On retire le joueur de la file s'il n'y a plus d'échec réseau à réessayer.
+        // Un échec de taille est définitif (le document sera toujours trop gros
+        // tant que la pièce jointe n'est pas remplacée) : on ne bloque pas dessus.
+        const aUnEchecReseau = echecsReseau.some(e=>e.id===id);
+        if(!aUnEchecReseau) filePendingJoueurs.delete(id);
+      });
+      taches.push(p);
     });
+
     if(comptesAEnvoyer){
-      batch.set(window.FB.metaRef, { comptes: DB.comptes, updated_at: Date.now() });
-      n++;
+      const p = window.FB.setDoc(window.FB.metaRef, { comptes: DB.comptes, updated_at: Date.now() })
+        .then(()=>{ filePendingComptes = false; })
+        .catch(err=>{ echecsReseau.push({type:'comptes', id:'meta', err}); });
+      taches.push(p);
     }
-    if(n>0) await batch.commit();
-    ascAEnvoyer.forEach(id=>filePendingAsc.delete(id));
-    joueursAEnvoyer.forEach(id=>filePendingJoueurs.delete(id));
-    if(comptesAEnvoyer) filePendingComptes = false;
-    majStatutSync('Synchronisé ✓');
+
+    await Promise.allSettled(taches);
+
+    [...echecsTaille, ...echecsReseau].forEach(({type,id,err})=>console.error(`Sync ${type} #${id} échouée :`, err));
+
+    if(echecsTaille.length){
+      const joueursConcernes = echecsTaille.map(e=>{
+        const j = DB.joueurs.find(x=>x.id===e.id);
+        return j ? `${j.prenom} ${j.nom} (${e.type})` : `${e.id} (${e.type})`;
+      });
+      majStatutSync(`⚠️ ${echecsTaille.length} pièce(s) jointe(s) trop lourde(s) ignorée(s) : ${joueursConcernes.join(', ')}`);
+    } else if(echecsReseau.length){
+      majStatutSync('Échec — nouvelle tentative au retour réseau');
+    } else {
+      majStatutSync('Synchronisé ✓');
+    }
   }catch(e){
     console.error("Sync Firestore échouée :", e);
     majStatutSync('Échec — nouvelle tentative au retour réseau');
-    // on NE VIDE PAS les files d'attente : elles repartiront au prochain essai
   }finally{
     syncEnCours = false;
   }
@@ -494,13 +608,42 @@ function fusionnerUnRecord(local, distant){
   return (distant.updated_at||0) >= (local.updated_at||0) ? distant : local;
 }
 
+/* Fusionne uniquement les champs de métadonnées d'un joueur, en conservant
+   la photo/l'extrait déjà présents localement (ils arrivent par des
+   documents Firestore séparés, voir plus haut). */
+function fusionnerMetaJoueur(local, distantMeta){
+  if(!distantMeta) return local;
+  if(!local) return distantMeta;
+  if((distantMeta.updated_at||0) >= (local.updated_at||0)){
+    return Object.assign({}, local, distantMeta);
+  }
+  return local;
+}
+function fusionnerPhotoJoueur(joueur, distant){
+  if(!joueur || !distant) return;
+  if((distant.updated_at||0) >= (joueur.photo_updated_at||0)){
+    joueur.photo = distant.photo;
+    joueur.photo_updated_at = distant.updated_at;
+  }
+}
+function fusionnerExtraitJoueur(joueur, distant){
+  if(!joueur || !distant) return;
+  if((distant.updated_at||0) >= (joueur.extrait_updated_at||0)){
+    joueur.extrait_naissance = distant.extrait_naissance;
+    joueur.extrait_naissance_nom = distant.extrait_naissance_nom;
+    joueur.extrait_updated_at = distant.updated_at;
+  }
+}
+
 async function initFirebaseSync(){
   if(!window.FB) return;
   try{
     // Chargement initial complet depuis Firestore, fusionné avec la copie locale
-    const [ascSnap, joueursSnap, metaSnap] = await Promise.all([
+    const [ascSnap, joueursSnap, photosSnap, extraitsSnap, metaSnap] = await Promise.all([
       window.FB.getDocs(window.FB.ascCol),
       window.FB.getDocs(window.FB.joueursCol),
+      window.FB.getDocs(window.FB.joueursPhotosCol),
+      window.FB.getDocs(window.FB.joueursExtraitsCol),
       window.FB.getDoc(window.FB.metaRef)
     ]);
     const ascParId = new Map(DB.asc.map(a=>[a.id, a]));
@@ -513,7 +656,15 @@ async function initFirebaseSync(){
     const joueursParId = new Map(DB.joueurs.map(j=>[j.id, j]));
     joueursSnap.forEach(d=>{
       const distant = d.data();
-      joueursParId.set(distant.id, fusionnerUnRecord(joueursParId.get(distant.id), distant));
+      joueursParId.set(distant.id, fusionnerMetaJoueur(joueursParId.get(distant.id), distant));
+    });
+    photosSnap.forEach(d=>{
+      const j = joueursParId.get(d.id);
+      if(j) fusionnerPhotoJoueur(j, d.data());
+    });
+    extraitsSnap.forEach(d=>{
+      const j = joueursParId.get(d.id);
+      if(j) fusionnerExtraitJoueur(j, d.data());
     });
     DB.joueurs = Array.from(joueursParId.values());
 
@@ -572,8 +723,17 @@ async function initFirebaseSync(){
         } else {
           const distant = ch.doc.data();
           const i = DB.joueurs.findIndex(j=>j.id===distant.id);
-          if(i===-1){ DB.joueurs.push(distant); changement = true; }
-          else if((distant.updated_at||0) >= (DB.joueurs[i].updated_at||0)){ DB.joueurs[i] = distant; changement = true; }
+          if(i===-1){
+            const photoOrpheline = joueursPhotosEnAttente.get(id);
+            if(photoOrpheline){ fusionnerPhotoJoueur(distant, photoOrpheline); joueursPhotosEnAttente.delete(id); }
+            const extraitOrphelin = joueursExtraitsEnAttente.get(id);
+            if(extraitOrphelin){ fusionnerExtraitJoueur(distant, extraitOrphelin); joueursExtraitsEnAttente.delete(id); }
+            DB.joueurs.push(distant); changement = true;
+          }
+          else if((distant.updated_at||0) >= (DB.joueurs[i].updated_at||0)){
+            DB.joueurs[i] = Object.assign({}, DB.joueurs[i], distant);
+            changement = true;
+          }
         }
       });
       if(changement){
@@ -582,6 +742,46 @@ async function initFirebaseSync(){
         if(utilisateurCourant) rafraichirTout();
       }
     }, (err)=>console.error("Écoute joueurs échouée :", err));
+
+    window.FB.onSnapshotCol(window.FB.joueursPhotosCol, (snap)=>{
+      let changement = false;
+      snap.docChanges().forEach(ch=>{
+        const id = ch.doc.id;
+        if(filePendingJoueurs.has(id)) return;
+        const j = DB.joueurs.find(x=>String(x.id)===id);
+        if(!j){ if(ch.type!=='removed') joueursPhotosEnAttente.set(id, ch.doc.data()); return; }
+        if(ch.type === 'removed'){
+          j.photo = null; j.photo_updated_at = Date.now(); changement = true;
+        } else {
+          fusionnerPhotoJoueur(j, ch.doc.data());
+          changement = true;
+        }
+      });
+      if(changement){
+        sauverLocal();
+        if(utilisateurCourant) rafraichirTout();
+      }
+    }, (err)=>console.error("Écoute photos joueurs échouée :", err));
+
+    window.FB.onSnapshotCol(window.FB.joueursExtraitsCol, (snap)=>{
+      let changement = false;
+      snap.docChanges().forEach(ch=>{
+        const id = ch.doc.id;
+        if(filePendingJoueurs.has(id)) return;
+        const j = DB.joueurs.find(x=>String(x.id)===id);
+        if(!j){ if(ch.type!=='removed') joueursExtraitsEnAttente.set(id, ch.doc.data()); return; }
+        if(ch.type === 'removed'){
+          j.extrait_naissance = null; j.extrait_naissance_nom = null; j.extrait_updated_at = Date.now(); changement = true;
+        } else {
+          fusionnerExtraitJoueur(j, ch.doc.data());
+          changement = true;
+        }
+      });
+      if(changement){
+        sauverLocal();
+        if(utilisateurCourant) rafraichirTout();
+      }
+    }, (err)=>console.error("Écoute extraits joueurs échouée :", err));
 
     // Reprise automatique dès que le téléphone retrouve du réseau ou revient au premier plan
     window.addEventListener('online', lancerSync);
@@ -717,7 +917,7 @@ function appliquerRole(){
    ========================================================= */
 function showPanel(name){
   // Garde-fou : un Secrétaire Général ne peut pas accéder aux panneaux réservés à l'admin
-  if(!estAdmin() && (name==='asc' || name==='licence' || name==='comptes')) name = 'dashboard';
+  if(!estAdmin() && (name==='asc' || name==='licence' || name==='historique' || name==='comptes')) name = 'dashboard';
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
   document.querySelectorAll('.navbtn').forEach(b=>b.classList.remove('active'));
@@ -725,6 +925,7 @@ function showPanel(name){
   if(btn) btn.classList.add('active');
   if(name==='liste') afficherListeJoueurs();
   if(name==='licence') remplirSelectLicence();
+  if(name==='historique') afficherHistorique();
   if(name==='dashboard') rafraichirStats();
   if(name==='monasc') afficherMonAsc();
   if(name==='comptes') afficherComptes();
@@ -736,6 +937,7 @@ function rafraichirTout(){
   remplirSelectAsc();
   afficherListeJoueurs();
   remplirSelectLicence();
+  if(document.getElementById('panel-historique').classList.contains('active')) afficherHistorique();
   if(estSecretaire()) afficherMonAsc();
   if(estAdmin()) afficherComptes();
 }
@@ -1005,13 +1207,52 @@ function previewExtrait(e){
     e.target.value='';
     return;
   }
+  // Firestore limite chaque document à 1 Mo. Un PDF non compressé (scan
+  // téléphone) dépasse facilement cette limite, ce qui bloquait la
+  // synchronisation de TOUT le monde (voir lancerSync). On refuse les PDF
+  // trop lourds et on compresse automatiquement les photos.
+  const LIMITE_PDF = 800*1024; // 800 Ko
+  if(file.type === 'application/pdf' && file.size > LIMITE_PDF){
+    alert(`Ce PDF est trop volumineux (${Math.round(file.size/1024)} Ko, limite 800 Ko).\n\nAstuce : prenez plutôt une PHOTO de l'extrait de naissance (elle sera compressée automatiquement) au lieu d'un scan PDF.`);
+    e.target.value='';
+    return;
+  }
   const reader = new FileReader();
   reader.onload = function(ev){
-    extraitTemp = ev.target.result;
-    extraitNomTemp = file.name;
-    document.getElementById('extraitPreviewWrap').innerHTML = `✅ ${file.name}`;
+    if(file.type.startsWith('image/')){
+      compresserExtraitImage(ev.target.result, file.name);
+    } else {
+      extraitTemp = ev.target.result;
+      extraitNomTemp = file.name;
+      document.getElementById('extraitPreviewWrap').innerHTML = `✅ ${file.name}`;
+    }
   };
   reader.readAsDataURL(file);
+}
+
+/* Compresse une photo d'extrait de naissance pour rester bien en-dessous
+   de la limite Firestore de 1 Mo par document. */
+function compresserExtraitImage(dataUrl, nomFichier){
+  const img = new Image();
+  img.onload = function(){
+    const MAX_DIM = 1400;
+    let w = img.naturalWidth, h = img.naturalHeight;
+    const scale = Math.min(1, MAX_DIM/Math.max(w,h));
+    w = Math.round(w*scale); h = Math.round(h*scale);
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    canvas.getContext('2d').drawImage(img,0,0,w,h);
+    let qualite = 0.75;
+    let out = canvas.toDataURL('image/jpeg', qualite);
+    while(out.length > 700*1024 && qualite > 0.3){
+      qualite -= 0.1;
+      out = canvas.toDataURL('image/jpeg', qualite);
+    }
+    extraitTemp = out;
+    extraitNomTemp = nomFichier;
+    document.getElementById('extraitPreviewWrap').innerHTML = `✅ ${nomFichier} (compressé)`;
+  };
+  img.src = dataUrl;
 }
 
 /* =========================================================
@@ -1072,19 +1313,22 @@ function enregistrerJoueur(){
     return;
   }
 
+  const maintenant = Date.now();
   const joueur = {
     id: genererIdUnique(),
     asc_id: ascId,
     prenom, nom,
     date_naissance: ddn,
     photo: photoTemp,
+    photo_updated_at: maintenant,
     extrait_naissance: extraitTemp,
     extrait_naissance_nom: extraitNomTemp,
+    extrait_updated_at: maintenant,
     saison: SAISON_COURANTE,
     categorie: "CADET",
     statut: "en_attente",
     numero_licence: null,
-    updated_at: Date.now()
+    updated_at: maintenant
   };
   DB.joueurs.push(joueur);
   sauverDB({joueurs:[joueur.id]});
@@ -1169,6 +1413,71 @@ function allerVersLicence(id){
 }
 
 /* =========================================================
+   HISTORIQUE DES LICENCES (générées / validées / prêtes à l'impression)
+   ========================================================= */
+function formaterDate(ts){
+  if(!ts) return '—';
+  return new Date(ts).toLocaleString('fr-FR', {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
+}
+function afficherHistorique(){
+  const selectFiltre = document.getElementById('filterAscHistorique');
+  if(selectFiltre){
+    const valeurActuelle = selectFiltre.value;
+    selectFiltre.innerHTML = '<option value="">Toutes les ASC</option>' +
+      DB.asc.map(a=>`<option value="${a.id}">${a.nom}</option>`).join('');
+    selectFiltre.value = valeurActuelle;
+  }
+  const tb = document.getElementById('historiqueTableBody');
+  if(!tb) return;
+  tb.innerHTML = '';
+  const filtre = selectFiltre ? selectFiltre.value : '';
+  let liste = DB.joueurs.filter(j=>j.numero_licence || j.date_generation);
+  if(filtre) liste = liste.filter(j=>j.asc_id===parseInt(filtre));
+  liste = liste.slice().sort((a,b)=>(b.date_generation||0)-(a.date_generation||0));
+  if(liste.length===0){
+    tb.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#888">Aucune licence générée pour le moment.</td></tr>';
+    return;
+  }
+  liste.forEach(j=>{
+    const asc = DB.asc.find(a=>a.id===j.asc_id) || {nom:'?'};
+    const pretCell = j.pret_impression
+      ? `✅ ${formaterDate(j.date_impression)}`
+      : '<span style="color:#999">—</span>';
+    let actions = `<button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="allerVersLicence(${j.id})">🪪 Voir</button>`;
+    if(j.statut==='valide'){
+      actions += j.pret_impression
+        ? ` <button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="annulerPretImpression(${j.id})">↩️ Annuler</button>`
+        : ` <button class="btn jaune" style="padding:5px 8px;font-size:11px;color:#1a1a1a" onclick="marquerPretImpression(${j.id})">🖨️ Prêt à imprimer</button>`;
+    }
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${j.prenom} ${j.nom}</td><td>${asc.nom}</td><td>${j.numero_licence||'—'}</td>
+      <td>${formaterDate(j.date_generation)}</td>
+      <td>${formaterDate(j.date_validation)}</td>
+      <td>${pretCell}</td>
+      <td class="actions">${actions}</td>`;
+    tb.appendChild(tr);
+  });
+}
+function marquerPretImpression(id){
+  const joueur = DB.joueurs.find(j=>j.id===id);
+  if(!joueur || joueur.statut!=='valide') return;
+  joueur.pret_impression = true;
+  joueur.date_impression = Date.now();
+  joueur.updated_at = Date.now();
+  sauverDB({joueurs:[id]});
+  afficherHistorique(); rafraichirStats();
+}
+function annulerPretImpression(id){
+  const joueur = DB.joueurs.find(j=>j.id===id);
+  if(!joueur) return;
+  joueur.pret_impression = false;
+  joueur.date_impression = null;
+  joueur.updated_at = Date.now();
+  sauverDB({joueurs:[id]});
+  afficherHistorique(); rafraichirStats();
+}
+
+/* =========================================================
    STATISTIQUES
    ========================================================= */
 function rafraichirStats(){
@@ -1176,6 +1485,7 @@ function rafraichirStats(){
   document.getElementById('statAsc').textContent = estSecretaire() ? 1 : DB.asc.length;
   document.getElementById('statJoueurs').textContent = joueurs.length;
   document.getElementById('statValides').textContent = joueurs.filter(j=>j.statut==='valide').length;
+  document.getElementById('statPrete').textContent = joueurs.filter(j=>j.pret_impression).length;
   document.getElementById('statAttente').textContent = joueurs.filter(j=>j.statut==='en_attente').length;
 }
 
@@ -1434,8 +1744,10 @@ function validerJoueurCourant(){
   if(!joueur) return;
   if(!joueur.numero_licence){
     joueur.numero_licence = genererNumeroLicence(joueur.asc_id, joueur.id);
+    joueur.date_generation = Date.now();
   }
   joueur.statut = 'valide';
+  joueur.date_validation = Date.now();
   joueur.updated_at = Date.now();
   sauverDB({joueurs:[joueur.id]});
   afficherListeJoueurs(); rafraichirStats(); genererApercu();
@@ -1445,6 +1757,11 @@ function telechargerLicence(){
   const id = parseInt(document.getElementById('licenceJoueur').value);
   const joueur = DB.joueurs.find(j=>j.id===id);
   if(!joueur){ alert("Choisissez un joueur."); return; }
+  if(!joueur.date_generation){
+    joueur.date_generation = Date.now();
+    joueur.updated_at = Date.now();
+    sauverDB({joueurs:[joueur.id]});
+  }
   const canvas = document.getElementById('canvaLicence');
   const lien = document.createElement('a');
   const nomFichier = `licence_${(joueur.numero_licence||'tmp').replace(/-/g,'_')}.png`;
@@ -1522,7 +1839,7 @@ function dedoublonnerJoueurs(liste){
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-app.js";
   import {
-    getFirestore, collection, doc, getDoc, getDocs, setDoc,
+    getFirestore, collection, doc, getDoc, getDocs, setDoc, deleteDoc,
     onSnapshot, writeBatch, enableIndexedDbPersistence
   } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore.js";
 
@@ -1545,19 +1862,27 @@ function dedoublonnerJoueurs(liste){
     console.warn("Persistance hors-ligne non activée :", err.code);
   });
 
-  // Un document Firestore par ASC et par joueur (au lieu d'un seul gros document)
-  // pour ne jamais dépasser la limite de 1 Mo par document et éviter les conflits
+  // Un document par ASC et par joueur (au lieu d'un seul gros document) pour
+  // ne jamais dépasser la limite de 1 Mo par document et éviter les conflits
   // d'écriture entre plusieurs téléphones utilisés en même temps.
+  // De plus, la photo et l'extrait de naissance de chaque joueur sont
+  // stockés dans leurs PROPRES collections ("zone13c_joueurs_photos" et
+  // "zone13c_joueurs_extraits"), séparées des métadonnées : même
+  // compressés, photo + extrait pourraient ensemble dépasser 1 Mo s'ils
+  // restaient dans le même document.
   const ascCol = collection(firestore, "zone13c_asc");
   const joueursCol = collection(firestore, "zone13c_joueurs");
+  const joueursPhotosCol = collection(firestore, "zone13c_joueurs_photos");
+  const joueursExtraitsCol = collection(firestore, "zone13c_joueurs_extraits");
   const metaRef = doc(firestore, "zone13c_meta", "comptes");
 
   window.FB = {
-    ascCol, joueursCol, metaRef,
+    ascCol, joueursCol, joueursPhotosCol, joueursExtraitsCol, metaRef,
     doc: (col, id) => doc(col, id),
     getDoc: (ref) => getDoc(ref),
     getDocs: (col) => getDocs(col),
     setDoc: (ref, data) => setDoc(ref, data),
+    deleteDoc: (ref) => deleteDoc(ref),
     onSnapshotCol: (col, next, error) => onSnapshot(col, next, error),
     batch: () => writeBatch(firestore)
   };
