@@ -351,10 +351,16 @@
       <div class="card">
         <h2>Historique des licences</h2>
         <p style="font-size:13px;color:#555;margin-bottom:10px">
-          Suivi des licences <b>générées</b>, <b>validées</b> et <b>prêtes à l'impression</b>.
+          Suivi des licences <b>générées</b>, <b>validées</b> et <b>prêtes à l'impression</b>.<br>
+          📦 Pour réduire l'espace occupé, la photo et l'extrait de naissance d'un joueur sont supprimés
+          automatiquement dès que sa licence est <b>validée</b> et que la carte a été <b>téléchargée</b>
+          (elle reste visible dans le fichier PNG déjà téléchargé).
         </p>
         <div class="field" style="max-width:300px"><label>Filtrer par ASC</label>
           <select id="filterAscHistorique" onchange="afficherHistorique()"><option value="">Toutes les ASC</option></select>
+        </div>
+        <div class="row-btn" style="margin-bottom:14px">
+          <button class="btn secondary" onclick="purgerLicencesDejaGenerees()">🗑️ Libérer l'espace (licences déjà validées/générées)</button>
         </div>
         <table>
           <thead><tr>
@@ -1426,7 +1432,15 @@ function effacerFormJoueur(){
 }
 function telechargerExtrait(id){
   const joueur = DB.joueurs.find(j=>j.id===id);
-  if(!joueur || !joueur.extrait_naissance){ alert("Aucun extrait de naissance enregistré pour ce joueur."); return; }
+  if(!joueur){ alert("Joueur introuvable."); return; }
+  if(!joueur.extrait_naissance){
+    if(joueur.pieces_jointes_purgees){
+      alert("L'extrait de naissance a été supprimé automatiquement de l'application après validation et génération de la licence, pour réduire l'espace de stockage.\n\nLa carte de licence déjà téléchargée en atteste.");
+    } else {
+      alert("Aucun extrait de naissance enregistré pour ce joueur.");
+    }
+    return;
+  }
   const lien = document.createElement('a');
   lien.href = joueur.extrait_naissance;
   lien.download = joueur.extrait_naissance_nom || `extrait_naissance_${joueur.nom}_${joueur.prenom}.pdf`;
@@ -1454,7 +1468,9 @@ function afficherListeJoueurs(){
       : (j.statut==='en_attente' ? `<button class="btn rouge" onclick="supprimerJoueur(${j.id})">Suppr.</button>` : '<span style="color:#999;font-size:11px">Transmis à l’admin</span>');
     const extraitCell = j.extrait_naissance
       ? `<button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="telechargerExtrait(${j.id})">📄 PDF</button>`
-      : '<span style="color:#a32420;font-size:11px">Manquant</span>';
+      : (j.pieces_jointes_purgees
+          ? '<span style="color:#8a9a8a;font-size:11px" title="Supprimé après validation et génération de la licence, pour réduire le stockage">🗑️ Allégé</span>'
+          : '<span style="color:#a32420;font-size:11px">Manquant</span>');
     tr.innerHTML = `<td>${j.prenom} ${j.nom}</td><td>${asc.nom}</td><td>${j.date_naissance}</td>
       <td>${extraitCell}</td>
       <td><span class="badge ${badgeClass}">${j.statut.replace('_',' ')}</span></td>
@@ -1520,6 +1536,11 @@ function afficherHistorique(){
       actions += j.pret_impression
         ? ` <button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="annulerPretImpression(${j.id})">↩️ Annuler</button>`
         : ` <button class="btn jaune" style="padding:5px 8px;font-size:11px;color:#1a1a1a" onclick="marquerPretImpression(${j.id})">🖨️ Prêt à imprimer</button>`;
+      if(j.photo || j.extrait_naissance){
+        actions += ` <button class="btn rouge" style="padding:5px 8px;font-size:11px" onclick="purgerJoueurUnique(${j.id})" title="Supprimer la photo/extrait de ce joueur pour libérer l'espace">🗑️</button>`;
+      } else if(j.pieces_jointes_purgees){
+        actions += ` <span style="color:#8a9a8a;font-size:11px" title="Photo/extrait déjà supprimés">✓ Allégé</span>`;
+      }
     }
     const tr = document.createElement('tr');
     tr.innerHTML = `<td>${j.prenom} ${j.nom}</td><td>${asc.nom}</td><td>${j.numero_licence||'—'}</td>
@@ -1714,7 +1735,7 @@ function dessinerLicenceSurCanvas(canvas, joueur, asc){
       const infos = [
         ["PRÉNOM & NOM", `${joueur.prenom} ${joueur.nom}`],
         ["DATE NAISSANCE", joueur.date_naissance],
-        ["EXTRAIT DE NAISSANCE", joueur.extrait_naissance ? "FOURNI ✓" : "—"],
+        ["EXTRAIT DE NAISSANCE", joueur.extrait_naissance ? "FOURNI ✓" : (joueur.pieces_jointes_purgees ? "VÉRIFIÉ ✓ (archivé)" : "—")],
         ["ASC", asc.nom.toUpperCase()],
         ["COULEURS", asc.couleurs || "—"],
         ["ENTRAÎNEUR", ((asc.entraineur_prenom||'')+' '+(asc.entraineur_nom||'')).trim() || "—"],
@@ -1776,7 +1797,11 @@ function dessinerLicenceSurCanvas(canvas, joueur, asc){
       img.src = joueur.photo;
     } else {
       ctx.font='13px Arial'; ctx.fillStyle='#88aa88'; ctx.textAlign='center';
-      ctx.fillText("PHOTO", photoX+photoW/2, photoY+photoH/2);
+      ctx.fillText(joueur.pieces_jointes_purgees ? "PHOTO ARCHIVÉE" : "PHOTO", photoX+photoW/2, photoY+photoH/2);
+      if(joueur.pieces_jointes_purgees){
+        ctx.font='10px Arial'; ctx.fillStyle='#88aa88';
+        ctx.fillText("(déjà téléchargée)", photoX+photoW/2, photoY+photoH/2+16);
+      }
       finPhoto();
     }
   }
@@ -1826,6 +1851,95 @@ function validerJoueurCourant(){
   afficherListeJoueurs(); rafraichirStats(); genererApercu();
 }
 
+/* =========================================================
+   PURGE DES PIÈCES JOINTES (photo + extrait) APRÈS LICENCE
+   ---------------------------------------------------------
+   Une fois la licence validée ET générée (numéro attribué, carte
+   dessinée puis téléchargée), la photo et l'extrait de naissance
+   d'origine ne servent plus à rien dans l'application : ils sont
+   déjà « figés » dans le fichier PNG téléchargé par l'utilisateur.
+   On les supprime donc de la base (localStorage + Firestore) pour
+   réduire l'espace occupé. Les métadonnées du joueur (nom, ASC,
+   numéro de licence, statut...) sont conservées intégralement.
+   Ceci est IRRÉVERSIBLE : la photo/l'extrait ne pourront plus être
+   réaffichés ni réutilisés dans l'app (seule la carte déjà
+   téléchargée en garde une trace visuelle). */
+function purgerPiecesJointesJoueur(joueur){
+  if(!joueur) return false;
+  const avaitDesDonnees = !!(joueur.photo || joueur.extrait_naissance);
+  joueur.photo = null;
+  joueur.photo_updated_at = Date.now();
+  joueur.extrait_naissance = null;
+  joueur.extrait_naissance_nom = null;
+  joueur.extrait_updated_at = Date.now();
+  joueur.pieces_jointes_purgees = true;
+  joueur.date_purge = Date.now();
+  joueur.updated_at = Date.now();
+  return avaitDesDonnees;
+}
+
+/* Purge automatique : appelée uniquement quand la licence a déjà été
+   VALIDÉE (statut === 'valide') ET que la carte vient d'être générée/
+   téléchargée. Le canvas déjà dessiné (et donc le PNG téléchargé)
+   n'est pas affecté : seule la donnée source en base est effacée. */
+function purgerApresGenerationSiValide(joueur){
+  if(!joueur || joueur.statut !== 'valide') return;
+  if(!joueur.photo && !joueur.extrait_naissance) return;
+  purgerPiecesJointesJoueur(joueur);
+  sauverDB({joueurs:[joueur.id]});
+  afficherListeJoueurs(); afficherHistorique(); rafraichirStats();
+  majStatutSync('🗑️ Photo/extrait supprimés de l’application (déjà dans la licence téléchargée) — espace libéré');
+}
+
+/* Outil de nettoyage rétroactif (panneau Historique, admin) : purge en
+   une fois tous les joueurs déjà validés ET dont la licence a déjà été
+   générée, pour libérer l'espace occupé par des données anciennes. */
+function purgerLicencesDejaGenerees(){
+  const candidats = DB.joueurs.filter(j =>
+    j.statut === 'valide' && j.numero_licence && (j.photo || j.extrait_naissance)
+  );
+  if(candidats.length === 0){
+    alert("Aucune donnée à supprimer : toutes les licences déjà validées et générées ont déjà été allégées.");
+    return;
+  }
+  const octetsAvant = tailleDBOctets();
+  const ok = confirm(
+    `⚠️ Cette action est IRRÉVERSIBLE.\n\n`+
+    `${candidats.length} joueur(s) ont une licence déjà VALIDÉE et GÉNÉRÉE.\n\n`+
+    `Leur photo et leur extrait de naissance vont être supprimés de l'application\n`+
+    `(seules les métadonnées — nom, ASC, numéro de licence — sont conservées).\n\n`+
+    `Assurez-vous d'avoir déjà téléchargé/imprimé leur carte de licence au format PNG,\n`+
+    `car il ne sera plus possible de la régénérer avec la photo après cette suppression.\n\n`+
+    `Continuer ?`
+  );
+  if(!ok) return;
+  candidats.forEach(j => purgerPiecesJointesJoueur(j));
+  sauverDB({joueurs: candidats.map(j=>j.id)});
+  const octetsApres = tailleDBOctets();
+  afficherListeJoueurs(); afficherHistorique(); rafraichirStats();
+  alert(`✅ ${candidats.length} joueur(s) allégé(s).\nEspace libéré : ${formaterOctets(Math.max(0, octetsAvant-octetsApres))}.`);
+}
+window.purgerLicencesDejaGenerees = purgerLicencesDejaGenerees;
+
+/* Purge manuelle d'un seul joueur (bouton 🗑️ dans l'historique) */
+function purgerJoueurUnique(id){
+  const joueur = DB.joueurs.find(j=>j.id===id);
+  if(!joueur || joueur.statut!=='valide') return;
+  if(!joueur.photo && !joueur.extrait_naissance){
+    alert("Ce joueur n'a plus de photo/extrait à supprimer.");
+    return;
+  }
+  const ok = confirm(
+    `Supprimer la photo et l'extrait de naissance de ${joueur.prenom} ${joueur.nom} ?\n\n`+
+    `⚠️ Irréversible. Assurez-vous d'avoir déjà téléchargé sa carte de licence (PNG).`
+  );
+  if(!ok) return;
+  purgerPiecesJointesJoueur(joueur);
+  sauverDB({joueurs:[id]});
+  afficherListeJoueurs(); afficherHistorique(); rafraichirStats();
+}
+window.purgerJoueurUnique = purgerJoueurUnique;
+
 function telechargerLicence(){
   const id = parseInt(document.getElementById('licenceJoueur').value);
   const joueur = DB.joueurs.find(j=>j.id===id);
@@ -1841,6 +1955,10 @@ function telechargerLicence(){
   lien.download = nomFichier;
   lien.href = canvas.toDataURL('image/png');
   lien.click();
+  // La carte (avec la photo) vient d'être téléchargée sur l'appareil de
+  // l'utilisateur : on peut donc supprimer la photo/l'extrait d'origine
+  // de l'application si le joueur est déjà validé, pour réduire l'espace.
+  purgerApresGenerationSiValide(joueur);
 }
 
 /* =========================================================
