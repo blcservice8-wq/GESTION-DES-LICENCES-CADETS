@@ -1639,7 +1639,7 @@ function dessinerLicenceSurCanvas(canvas, joueur, asc){
       const ix = photoX+photoW+25;
       let iy = TOP+22;
       const infos = [
-        ["NOM & PRÉNOM", `${joueur.nom} ${joueur.prenom}`],
+        ["PRÉNOM & NOM", `${joueur.prenom} ${joueur.nom}`],
         ["DATE NAISSANCE", joueur.date_naissance],
         ["EXTRAIT DE NAISSANCE", joueur.extrait_naissance ? "FOURNI ✓" : "—"],
         ["ASC", asc.nom.toUpperCase()],
