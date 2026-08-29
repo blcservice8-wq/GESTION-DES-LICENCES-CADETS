@@ -200,7 +200,9 @@
           Cette application fonctionne <b>entièrement dans votre navigateur Chrome</b>, sans connexion internet ni serveur externe.
           Toutes les données (ASC, joueurs, photos) sont enregistrées localement sur cet ordinateur, dans la mémoire du navigateur.<br><br>
           ⚠️ <b>Important :</b> pensez à utiliser le bouton <b>« Exporter les données »</b> régulièrement pour sauvegarder votre travail
-          dans un fichier, et à le réimporter si vous changez d'ordinateur ou videz le cache de Chrome.
+          dans un fichier, et à le réimporter si vous changez d'ordinateur ou videz le cache de Chrome.<br><br>
+          📦 Espace occupé dans le navigateur : <b id="espaceUtilise">…</b>
+          <span style="color:#8a9a8a">(les photos et extraits sont automatiquement compressés pour limiter cette taille)</span>
         </p>
         <div class="row-btn">
           <button class="btn jaune" style="color:#1a1a1a" onclick="exporterDonnees()">💾 Exporter les données</button>
@@ -407,8 +409,50 @@ function chargerDB(){
   return db;
 }
 
+/* Taille approximative (en octets) occupée par la base dans localStorage.
+   Sert à afficher l'espace utilisé et à détecter qu'on approche de la
+   limite du navigateur (souvent 5 à 10 Mo par site sur téléphone). */
+function tailleDBOctets(){
+  try{ return new Blob([JSON.stringify(DB)]).size; }
+  catch(e){ return JSON.stringify(DB).length; }
+}
+function formaterOctets(o){
+  if(o < 1024) return o+' o';
+  if(o < 1024*1024) return Math.round(o/1024)+' Ko';
+  return (o/1024/1024).toFixed(2)+' Mo';
+}
+function majAffichageEspace(){
+  const el = document.getElementById('espaceUtilise');
+  if(el) el.textContent = formaterOctets(tailleDBOctets());
+}
+
+/* sauverLocal() peut échouer si le navigateur a atteint sa limite de
+   stockage local (fréquent sur téléphone après beaucoup de photos/PDF
+   accumulés) : l'écriture est alors silencieusement refusée et les
+   nouvelles fiches ne sont jamais sauvegardées ni synchronisées.
+   On détecte ce cas précis et on prévient clairement l'utilisateur au
+   lieu de laisser l'application échouer sans explication. */
 function sauverLocal(){
-  localStorage.setItem(DB_KEY, JSON.stringify(DB));
+  try{
+    localStorage.setItem(DB_KEY, JSON.stringify(DB));
+    majAffichageEspace();
+    return true;
+  }catch(err){
+    const pleinEspace = err && (err.name === 'QuotaExceededError' || err.code === 22 || err.code === 1014);
+    if(pleinEspace){
+      majStatutSync('⛔ Mémoire du navigateur pleine — données NON sauvegardées');
+      alert("⛔ Espace de stockage du navigateur plein.\n\n"+
+            "Les dernières données n'ont pas pu être enregistrées.\n\n"+
+            "Solutions :\n"+
+            "1) Cliquez sur « 🔄 Synchroniser » pour envoyer les fiches déjà en mémoire vers Firestore, puis rechargez la page.\n"+
+            "2) Exportez régulièrement vos données (bouton « 💾 Exporter les données ») et videz le cache du navigateur.\n"+
+            "3) Évitez d'ajouter des PDF lourds comme extrait de naissance : préférez une photo, compressée automatiquement.");
+    } else {
+      console.error('Échec sauvegarde locale :', err);
+      majStatutSync('⚠️ Échec de la sauvegarde locale');
+    }
+    return false;
+  }
 }
 
 function majStatutSync(texte){
@@ -1182,6 +1226,24 @@ function cancelCrop(){
   document.getElementById('jPhoto').value='';
 }
 
+/* Compresse un <canvas> en JPEG en réduisant progressivement la qualité
+   jusqu'à passer sous la taille cible (en octets), sans jamais descendre
+   sous une qualité minimale qui rendrait l'image illisible. Utilisée pour
+   la photo du joueur ET pour l'extrait de naissance photographié, afin
+   que chaque pièce jointe reste largement sous la limite Firestore de
+   1 Mo par document et occupe le moins de place possible en localStorage. */
+function compresserCanvasJPEG(canvas, tailleMaxOctets, qualiteDepart, qualiteMin){
+  qualiteDepart = qualiteDepart || 0.85;
+  qualiteMin = qualiteMin || 0.35;
+  let qualite = qualiteDepart;
+  let out = canvas.toDataURL('image/jpeg', qualite);
+  while(out.length > tailleMaxOctets && qualite > qualiteMin){
+    qualite -= 0.08;
+    out = canvas.toDataURL('image/jpeg', qualite);
+  }
+  return out;
+}
+
 function validerCrop(){
   const OUT_W = 310, OUT_H = 390; // export en meilleure résolution, même ratio
   const canvas = document.createElement('canvas');
@@ -1195,8 +1257,13 @@ function validerCrop(){
   const sw = cropState.frame.w / scale;
   const sh = cropState.frame.h / scale;
   ctx.drawImage(img, sx, sy, sw, sh, 0, 0, OUT_W, OUT_H);
-  photoTemp = canvas.toDataURL('image/jpeg', 0.92);
-  document.getElementById('photoPreviewWrap').innerHTML = `<img src="${photoTemp}">`;
+  // Cible : 120 Ko max (largement suffisant pour une photo d'identité
+  // 310x390, tout en restant net). Avant : qualité fixe 0.92, sans
+  // limite, ce qui pouvait produire des photos inutilement lourdes.
+  const CIBLE_PHOTO = 120*1024;
+  photoTemp = compresserCanvasJPEG(canvas, CIBLE_PHOTO, 0.85, 0.4);
+  document.getElementById('photoPreviewWrap').innerHTML =
+    `<img src="${photoTemp}"><div style="font-size:11px;color:#8a9a8a;margin-top:4px">Taille compressée : ${formaterOctets(photoTemp.length)}</div>`;
   document.getElementById('cropOverlay').classList.remove('active');
 }
 function previewExtrait(e){
@@ -1231,26 +1298,31 @@ function previewExtrait(e){
 }
 
 /* Compresse une photo d'extrait de naissance pour rester bien en-dessous
-   de la limite Firestore de 1 Mo par document. */
+   de la limite Firestore de 1 Mo par document, et pour limiter l'espace
+   occupé en localStorage (important sur téléphone). On réduit d'abord la
+   qualité JPEG ; si ça ne suffit pas (texte du document très détaillé),
+   on réduit aussi la résolution puis on recompresse. */
 function compresserExtraitImage(dataUrl, nomFichier){
   const img = new Image();
   img.onload = function(){
-    const MAX_DIM = 1400;
-    let w = img.naturalWidth, h = img.naturalHeight;
-    const scale = Math.min(1, MAX_DIM/Math.max(w,h));
-    w = Math.round(w*scale); h = Math.round(h*scale);
-    const canvas = document.createElement('canvas');
-    canvas.width = w; canvas.height = h;
-    canvas.getContext('2d').drawImage(img,0,0,w,h);
-    let qualite = 0.75;
-    let out = canvas.toDataURL('image/jpeg', qualite);
-    while(out.length > 700*1024 && qualite > 0.3){
-      qualite -= 0.1;
-      out = canvas.toDataURL('image/jpeg', qualite);
+    const CIBLE_EXTRAIT = 350*1024; // avant : 700 Ko
+    let maxDim = 1100;              // avant : 1400 px
+    let out;
+    for(let essai=0; essai<3; essai++){
+      let w = img.naturalWidth, h = img.naturalHeight;
+      const scale = Math.min(1, maxDim/Math.max(w,h));
+      w = Math.round(w*scale); h = Math.round(h*scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img,0,0,w,h);
+      out = compresserCanvasJPEG(canvas, CIBLE_EXTRAIT, 0.75, 0.3);
+      if(out.length <= CIBLE_EXTRAIT) break;
+      maxDim = Math.round(maxDim*0.75); // encore trop lourd : on réduit la résolution et on réessaie
     }
     extraitTemp = out;
     extraitNomTemp = nomFichier;
-    document.getElementById('extraitPreviewWrap').innerHTML = `✅ ${nomFichier} (compressé)`;
+    document.getElementById('extraitPreviewWrap').innerHTML =
+      `✅ ${nomFichier} (compressé — ${formaterOctets(extraitTemp.length)})`;
   };
   img.src = dataUrl;
 }
@@ -1487,6 +1559,7 @@ function rafraichirStats(){
   document.getElementById('statValides').textContent = joueurs.filter(j=>j.statut==='valide').length;
   document.getElementById('statPrete').textContent = joueurs.filter(j=>j.pret_impression).length;
   document.getElementById('statAttente').textContent = joueurs.filter(j=>j.statut==='en_attente').length;
+  majAffichageEspace();
 }
 
 /* =========================================================
