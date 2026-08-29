@@ -179,7 +179,6 @@
     <button class="navbtn" data-panel="joueur" onclick="showPanel('joueur')">📝 Enregistrer un joueur</button>
     <button class="navbtn" data-panel="liste" onclick="showPanel('liste')">📋 Liste des joueurs</button>
     <button class="navbtn admin-only" data-panel="licence" onclick="showPanel('licence')">🪪 Générer la licence</button>
-    <button class="navbtn admin-only" data-panel="historique" onclick="showPanel('historique')">🗂️ Historique</button>
     <button class="navbtn admin-only" data-panel="comptes" onclick="showPanel('comptes')">👥 Comptes</button>
   </nav>
 
@@ -343,22 +342,6 @@
       </div>
     </div>
 
-    <!-- ============ HISTORIQUE DES LICENCES (Admin) ============ -->
-    <div class="panel" id="panel-historique">
-      <div class="card">
-        <h2>Historique des licences validées</h2>
-        <p style="font-size:13px;color:#555">
-          Licences déjà générées, validées et prêtes à l'impression. Dès la validation,
-          la photo et l'extrait de naissance bruts sont supprimés du stockage —
-          seule cette carte finale (image compacte) est conservée ici.
-        </p>
-        <table>
-          <thead><tr><th>Carte</th><th>Joueur</th><th>ASC</th><th>N° Licence</th><th>Saison</th><th>Générée le</th><th>Actions</th></tr></thead>
-          <tbody id="historiqueTableBody"></tbody>
-        </table>
-      </div>
-    </div>
-
     <!-- ============ COMPTES (Admin) ============ -->
     <div class="panel" id="panel-comptes">
       <div class="card">
@@ -380,7 +363,7 @@
 
 <script>
 /* =========================================================
-   DONNÉES — stockage local navigateur (localStorage)
+   DONNÉES — stockage local (localStorage) + synchronisation Firestore
    ========================================================= */
 const DB_KEY = "zone13c_db_v1";
 const AGE_MIN = 13, AGE_MAX = 17, JOUEURS_MAX = 22;
@@ -389,78 +372,21 @@ const VALIDITE_LICENCE = "2026-2027"; // durée de validité : 2 ans
 
 function chargerDB(){
   let raw = localStorage.getItem(DB_KEY);
+  let db;
   if(!raw){
-    let db = {
-      comptes: [{login:"admin", pwd:"admin123", role:"admin", updated_at:Date.now()}],
-      asc: [],
-      joueurs: [],
-      historique: [],
-      nextAscId: 1,
-      nextJoueurId: 1
-    };
+    db = { comptes: [{login:"admin", pwd:"admin123", role:"admin"}], asc: [], joueurs: [] };
     localStorage.setItem(DB_KEY, JSON.stringify(db));
-    return db;
+  } else {
+    db = JSON.parse(raw);
+    if(!db.comptes) db.comptes = [{login:"admin", pwd:"admin123", role:"admin"}];
+    if(!db.asc) db.asc = [];
+    if(!db.joueurs) db.joueurs = [];
   }
-  const db = JSON.parse(raw);
-  if(!db.historique) db.historique = []; // migration : anciennes bases sans historique
   return db;
 }
-let firestoreWriting = false;
-let firestoreLastJSON = null;
 
-/* ---------------------------------------------------------
-   SUPPRESSIONS PERSISTANTES (tombstones)
-   BUG CORRIGÉ : une suppression locale (filter) disparaissait
-   au prochain merge, car l'enregistrement supprimé n'existait
-   plus nulle part pour "battre" la copie distante. On marque
-   maintenant deleted:true + updated_at à jour ; fusionnerListes
-   propage alors la suppression comme n'importe quelle autre
-   modification. Tout l'affichage lit ces listes "actifs".
-   --------------------------------------------------------- */
-function joueursActifs(){ return DB.joueurs.filter(j=>!j.deleted); }
-function ascActifs(){ return DB.asc.filter(a=>!a.deleted); }
-function comptesActifs(){ return DB.comptes.filter(c=>!c.deleted); }
-function historiqueActifs(){ return (DB.historique||[]).filter(h=>!h.deleted); }
-
-/* ---------------------------------------------------------
-   FUSION DES DONNÉES (anti-écrasement)
-   BUG CORRIGÉ : l'ancienne synchronisation remplaçait TOUTE
-   la base par la dernière écriture reçue. Résultat : si
-   l'admin validait une licence pendant qu'un Secrétaire
-   Général enregistrait un joueur depuis une copie locale
-   plus ancienne, l'écriture du Secrétaire écrasait la
-   licence de l'admin (qui redevenait "en attente" et
-   disparaissait chez le Secrétaire). On fusionne maintenant
-   enregistrement par enregistrement, en gardant toujours la
-   version la plus récente (updated_at le plus grand).
-   --------------------------------------------------------- */
-function fusionnerListes(listeLocale, listeDistante, cleId){
-  const parId = new Map();
-  (listeDistante||[]).forEach(item => parId.set(item[cleId], item));
-  (listeLocale||[]).forEach(item => {
-    const existant = parId.get(item[cleId]);
-    if(!existant || (item.updated_at||0) >= (existant.updated_at||0)){
-      parId.set(item[cleId], item);
-    }
-  });
-  return Array.from(parId.values());
-}
-function fusionnerDB(local, distant){
-  if(!distant) return local;
-  if(!local) return distant;
-  return {
-    comptes: fusionnerListes(local.comptes, distant.comptes, 'login'),
-    asc: fusionnerListes(local.asc, distant.asc, 'id'),
-    joueurs: fusionnerListes(local.joueurs, distant.joueurs, 'id'),
-    historique: fusionnerListes(local.historique, distant.historique, 'id'),
-    nextAscId: Math.max(local.nextAscId||1, distant.nextAscId||1),
-    nextJoueurId: Math.max(local.nextJoueurId||1, distant.nextJoueurId||1)
-  };
-}
-
-function sauverDB(){
+function sauverLocal(){
   localStorage.setItem(DB_KEY, JSON.stringify(DB));
-  syncVersFirestore();
 }
 
 function majStatutSync(texte){
@@ -468,62 +394,202 @@ function majStatutSync(texte){
   if(el) el.textContent = texte;
 }
 
-async function syncVersFirestore(){
-  if(!window.FB) return; // Firebase pas encore prêt
-  firestoreWriting = true;
+/* ---------------------------------------------------------
+   SYNCHRONISATION FIRESTORE — PROBLÈME RÉSOLU
+   -----------------------------------------------------------
+   Avant : toute la base (ASC + joueurs + photos + PDF) était
+   stockée dans UN SEUL document Firestore. Or Firestore limite
+   chaque document à 1 Mo. Dès que quelques joueurs avaient une
+   photo et un extrait de naissance en pièce jointe, ce document
+   dépassait la limite et l'écriture échouait silencieusement —
+   surtout visible sur téléphone, où les Secrétaires Généraux
+   enregistrent des joueurs en continu avec photo + PDF.
+   En plus, chaque sauvegarde relisait puis réécrivait le document
+   entier : deux téléphones qui sauvegardaient à quelques secondes
+   d'intervalle pouvaient se marcher dessus.
+
+   Solution : chaque ASC et chaque joueur est maintenant son
+   PROPRE document Firestore (collections "zone13c_asc" et
+   "zone13c_joueurs"). Un compte (avec sa photo/PDF) ne dépasse
+   plus jamais la limite, et deux appareils qui modifient deux
+   joueurs différents en même temps ne se gênent plus.
+   On garde aussi une file d'attente locale : si le téléphone est
+   hors-ligne, les modifications restent en attente et repartent
+   automatiquement dès le retour du réseau.
+   --------------------------------------------------------- */
+let filePendingAsc = new Set();
+let filePendingJoueurs = new Set();
+let filePendingComptes = false;
+let syncEnCours = false;
+let syncEcouteursInitialises = false;
+
+function sauverDB(opts){
+  sauverLocal();
+  opts = opts || {};
+  if(opts.full){
+    DB.asc.forEach(a=>filePendingAsc.add(a.id));
+    DB.joueurs.forEach(j=>filePendingJoueurs.add(j.id));
+    filePendingComptes = true;
+  } else {
+    (opts.asc||[]).forEach(id=>filePendingAsc.add(id));
+    (opts.joueurs||[]).forEach(id=>filePendingJoueurs.add(id));
+    if(opts.comptes) filePendingComptes = true;
+  }
+  lancerSync();
+}
+
+async function lancerSync(){
+  if(!window.FB) return;
+  if(syncEnCours) return;
+  if(filePendingAsc.size===0 && filePendingJoueurs.size===0 && !filePendingComptes) return;
+  if(navigator.onLine === false){ majStatutSync('Hors ligne — en attente de réseau'); return; }
+  syncEnCours = true;
   majStatutSync('Synchronisation…');
+  const ascAEnvoyer = Array.from(filePendingAsc);
+  const joueursAEnvoyer = Array.from(filePendingJoueurs);
+  const comptesAEnvoyer = filePendingComptes;
   try{
-    // Lecture + fusion + écriture en une transaction Firestore
-    // atomique (voir window.FB.fusionEtEcrire) : plus de fenêtre
-    // de conflit entre deux téléphones qui écrivent en même temps.
-    const fusion = await window.FB.fusionEtEcrire(fusionnerDB, DB);
-    DB = fusion;
-    const json = JSON.stringify(DB);
-    localStorage.setItem(DB_KEY, json);
-    firestoreLastJSON = json;
+    const batch = window.FB.batch();
+    let n = 0;
+    ascAEnvoyer.forEach(id=>{
+      const a = DB.asc.find(x=>x.id===id);
+      const ref = window.FB.doc(window.FB.ascCol, String(id));
+      if(a) batch.set(ref, a); else batch.delete(ref);
+      n++;
+    });
+    joueursAEnvoyer.forEach(id=>{
+      const j = DB.joueurs.find(x=>x.id===id);
+      const ref = window.FB.doc(window.FB.joueursCol, String(id));
+      if(j) batch.set(ref, j); else batch.delete(ref);
+      n++;
+    });
+    if(comptesAEnvoyer){
+      batch.set(window.FB.metaRef, { comptes: DB.comptes, updated_at: Date.now() });
+      n++;
+    }
+    if(n>0) await batch.commit();
+    ascAEnvoyer.forEach(id=>filePendingAsc.delete(id));
+    joueursAEnvoyer.forEach(id=>filePendingJoueurs.delete(id));
+    if(comptesAEnvoyer) filePendingComptes = false;
     majStatutSync('Synchronisé ✓');
   }catch(e){
-    console.error("Sync Firestore (écriture) échouée :", e);
-    majStatutSync('Échec de synchronisation');
+    console.error("Sync Firestore échouée :", e);
+    majStatutSync('Échec — nouvelle tentative au retour réseau');
+    // on NE VIDE PAS les files d'attente : elles repartiront au prochain essai
   }finally{
-    firestoreWriting = false;
+    syncEnCours = false;
   }
 }
 
 async function synchroniserManuellement(){
   if(!window.FB){ majStatutSync('Firebase non disponible'); return; }
-  await syncVersFirestore();
+  await lancerSync();
   if(utilisateurCourant) rafraichirTout();
 }
 window.synchroniserManuellement = synchroniserManuellement;
 
+function fusionnerUnRecord(local, distant){
+  if(!distant) return local;
+  if(!local) return distant;
+  return (distant.updated_at||0) >= (local.updated_at||0) ? distant : local;
+}
+
 async function initFirebaseSync(){
   if(!window.FB) return;
   try{
-    const snap = await window.FB.getDoc(window.FB.docRef);
-    if(snap.exists() && snap.data().data){
-      const distant = JSON.parse(snap.data().data);
-      DB = fusionnerDB(DB, distant);
-      firestoreLastJSON = JSON.stringify(DB);
-      localStorage.setItem(DB_KEY, firestoreLastJSON);
-    } else {
-      // Aucune donnée distante : on envoie la base locale comme point de départ
-      syncVersFirestore();
+    // Chargement initial complet depuis Firestore, fusionné avec la copie locale
+    const [ascSnap, joueursSnap, metaSnap] = await Promise.all([
+      window.FB.getDocs(window.FB.ascCol),
+      window.FB.getDocs(window.FB.joueursCol),
+      window.FB.getDoc(window.FB.metaRef)
+    ]);
+    const ascParId = new Map(DB.asc.map(a=>[a.id, a]));
+    ascSnap.forEach(d=>{
+      const distant = d.data();
+      ascParId.set(distant.id, fusionnerUnRecord(ascParId.get(distant.id), distant));
+    });
+    DB.asc = Array.from(ascParId.values());
+
+    const joueursParId = new Map(DB.joueurs.map(j=>[j.id, j]));
+    joueursSnap.forEach(d=>{
+      const distant = d.data();
+      joueursParId.set(distant.id, fusionnerUnRecord(joueursParId.get(distant.id), distant));
+    });
+    DB.joueurs = Array.from(joueursParId.values());
+
+    if(metaSnap.exists() && metaSnap.data().comptes){
+      const distant = metaSnap.data();
+      if((distant.updated_at||0) >= 0){
+        // fusionne par login, garde le plus récent des deux listes
+        const parLogin = new Map(DB.comptes.map(c=>[c.login, c]));
+        (distant.comptes||[]).forEach(c=>parLogin.set(c.login, c));
+        DB.comptes = Array.from(parLogin.values());
+      }
     }
+    sauverLocal();
+    majStatutSync('Synchronisé ✓');
   }catch(e){
-    console.error("Sync Firestore (lecture initiale) échouée :", e);
+    console.error("Sync Firestore (chargement initial) échouée :", e);
+    majStatutSync('Échec de synchronisation initiale');
   }
-  window.FB.onSnapshot(window.FB.docRef, (snap) => {
-    if(firestoreWriting) return;
-    if(!snap.exists()) return;
-    const remote = snap.data();
-    if(!remote || !remote.data || remote.data === firestoreLastJSON) return;
-    firestoreLastJSON = remote.data;
-    DB = fusionnerDB(DB, JSON.parse(remote.data));
-    localStorage.setItem(DB_KEY, JSON.stringify(DB));
-    majStatutSync('Mis à jour ✓');
-    if(utilisateurCourant) rafraichirTout();
-  }, (err) => console.error("Sync Firestore (écoute) échouée :", err));
+
+  // Envoie tout ce qui n'existait que localement (première utilisation / données créées hors-ligne)
+  sauverDB({full:true});
+
+  if(!syncEcouteursInitialises){
+    syncEcouteursInitialises = true;
+
+    window.FB.onSnapshotCol(window.FB.ascCol, (snap)=>{
+      let changement = false;
+      snap.docChanges().forEach(ch=>{
+        const id = ch.doc.id;
+        if(filePendingAsc.has(id)) return; // on a une modif locale plus récente en attente d'envoi
+        if(ch.type === 'removed'){
+          DB.asc = DB.asc.filter(a=>String(a.id)!==id);
+          changement = true;
+        } else {
+          const distant = ch.doc.data();
+          const i = DB.asc.findIndex(a=>a.id===distant.id);
+          if(i===-1){ DB.asc.push(distant); changement = true; }
+          else if((distant.updated_at||0) >= (DB.asc[i].updated_at||0)){ DB.asc[i] = distant; changement = true; }
+        }
+      });
+      if(changement){
+        sauverLocal();
+        majStatutSync('Mis à jour ✓');
+        if(utilisateurCourant) rafraichirTout();
+      }
+    }, (err)=>console.error("Écoute ASC échouée :", err));
+
+    window.FB.onSnapshotCol(window.FB.joueursCol, (snap)=>{
+      let changement = false;
+      snap.docChanges().forEach(ch=>{
+        const id = ch.doc.id;
+        if(filePendingJoueurs.has(id)) return;
+        if(ch.type === 'removed'){
+          DB.joueurs = DB.joueurs.filter(j=>String(j.id)!==id);
+          changement = true;
+        } else {
+          const distant = ch.doc.data();
+          const i = DB.joueurs.findIndex(j=>j.id===distant.id);
+          if(i===-1){ DB.joueurs.push(distant); changement = true; }
+          else if((distant.updated_at||0) >= (DB.joueurs[i].updated_at||0)){ DB.joueurs[i] = distant; changement = true; }
+        }
+      });
+      if(changement){
+        sauverLocal();
+        majStatutSync('Mis à jour ✓');
+        if(utilisateurCourant) rafraichirTout();
+      }
+    }, (err)=>console.error("Écoute joueurs échouée :", err));
+
+    // Reprise automatique dès que le téléphone retrouve du réseau ou revient au premier plan
+    window.addEventListener('online', lancerSync);
+    document.addEventListener('visibilitychange', function(){
+      if(document.visibilityState === 'visible') lancerSync();
+    });
+  }
+
   if(utilisateurCourant) rafraichirTout();
 }
 window.initFirebaseSync = initFirebaseSync;
@@ -545,7 +611,7 @@ let extraitNomTemp = null; // nom du fichier PDF temporaire
 function seConnecter(){
   const login = document.getElementById('loginUser').value.trim();
   const pwd = document.getElementById('loginPwd').value;
-  const compte = comptesActifs().find(c => c.login === login && c.pwd === pwd);
+  const compte = DB.comptes.find(c => c.login === login && c.pwd === pwd);
   const msg = document.getElementById('loginMsg');
   if(!compte){
     msg.style.display='block';
@@ -600,11 +666,11 @@ function creerCompteAsc(){
     msgBox.innerHTML = '<div class="alert err">Le mot de passe doit contenir au moins 4 caractères.</div>';
     return;
   }
-  if(ascActifs().find(a=>a.nom.toLowerCase()===ascNom.toLowerCase())){
+  if(DB.asc.find(a=>a.nom.toLowerCase()===ascNom.toLowerCase())){
     msgBox.innerHTML = '<div class="alert err">Cette ASC existe déjà. Contactez l’administrateur si c’est votre association.</div>';
     return;
   }
-  if(comptesActifs().find(c=>c.login.toLowerCase()===login.toLowerCase())){
+  if(DB.comptes.find(c=>c.login.toLowerCase()===login.toLowerCase())){
     msgBox.innerHTML = '<div class="alert err">Cet identifiant est déjà utilisé.</div>';
     return;
   }
@@ -612,7 +678,7 @@ function creerCompteAsc(){
   const asc = {id:genererIdUnique(), nom:ascNom, couleurs, entraineur_prenom:entP, entraineur_nom:entN, actif:1, updated_at:Date.now()};
   DB.asc.push(asc);
   DB.comptes.push({login, pwd, role:"secretaire", asc_id: asc.id, updated_at:Date.now()});
-  sauverDB();
+  sauverDB({asc:[asc.id], comptes:true});
 
   // Connexion automatique du nouveau Secrétaire Général
   retourLogin();
@@ -640,7 +706,7 @@ function appliquerRole(){
   // Si le panneau actif n'est pas accessible au rôle courant, retour au tableau de bord
   if(!admin){
     const actif = document.querySelector('.panel.active');
-    if(actif && (actif.id==='panel-asc' || actif.id==='panel-licence' || actif.id==='panel-historique' || actif.id==='panel-comptes')){
+    if(actif && (actif.id==='panel-asc' || actif.id==='panel-licence' || actif.id==='panel-comptes')){
       showPanel('dashboard');
     }
   }
@@ -651,7 +717,7 @@ function appliquerRole(){
    ========================================================= */
 function showPanel(name){
   // Garde-fou : un Secrétaire Général ne peut pas accéder aux panneaux réservés à l'admin
-  if(!estAdmin() && (name==='asc' || name==='licence' || name==='historique' || name==='comptes')) name = 'dashboard';
+  if(!estAdmin() && (name==='asc' || name==='licence' || name==='comptes')) name = 'dashboard';
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.getElementById('panel-'+name).classList.add('active');
   document.querySelectorAll('.navbtn').forEach(b=>b.classList.remove('active'));
@@ -659,7 +725,6 @@ function showPanel(name){
   if(btn) btn.classList.add('active');
   if(name==='liste') afficherListeJoueurs();
   if(name==='licence') remplirSelectLicence();
-  if(name==='historique') afficherHistorique();
   if(name==='dashboard') rafraichirStats();
   if(name==='monasc') afficherMonAsc();
   if(name==='comptes') afficherComptes();
@@ -673,7 +738,6 @@ function rafraichirTout(){
   remplirSelectLicence();
   if(estSecretaire()) afficherMonAsc();
   if(estAdmin()) afficherComptes();
-  if(estAdmin()) afficherHistorique();
 }
 
 /* =========================================================
@@ -708,12 +772,13 @@ function ajouterAsc(){
     msgBox.innerHTML = '<div class="alert err">Le nom de l’ASC est obligatoire.</div>';
     return;
   }
-  if(ascActifs().find(a=>a.nom.toLowerCase()===nom.toLowerCase())){
+  if(DB.asc.find(a=>a.nom.toLowerCase()===nom.toLowerCase())){
     msgBox.innerHTML = '<div class="alert err">Cette ASC existe déjà.</div>';
     return;
   }
-  DB.asc.push({id:genererIdUnique(), nom, couleurs, entraineur_prenom:entP, entraineur_nom:entN, actif:1, updated_at:Date.now()});
-  sauverDB();
+  const nouvelleAsc = {id:genererIdUnique(), nom, couleurs, entraineur_prenom:entP, entraineur_nom:entN, actif:1, updated_at:Date.now()};
+  DB.asc.push(nouvelleAsc);
+  sauverDB({asc:[nouvelleAsc.id]});
   msgBox.innerHTML = '<div class="alert ok">✅ ASC « '+nom+' » ajoutée avec succès.</div>';
   document.getElementById('ascNom').value='';
   document.getElementById('ascCouleurs').value='';
@@ -724,23 +789,20 @@ function ajouterAsc(){
   rafraichirStats();
 }
 function supprimerAsc(id){
-  if(joueursActifs().some(j=>j.asc_id===id)){
+  if(DB.joueurs.some(j=>j.asc_id===id)){
     alert("Impossible de supprimer : des joueurs sont liés à cette ASC.");
     return;
   }
   if(!confirm("Supprimer cette ASC ?")) return;
-  const asc = DB.asc.find(a=>a.id===id);
-  if(!asc) return;
-  asc.deleted = true;
-  asc.updated_at = Date.now();
-  sauverDB();
+  DB.asc = DB.asc.filter(a=>a.id!==id);
+  sauverDB({asc:[id]});
   afficherAscTable(); remplirSelectAsc(); rafraichirStats();
 }
 function afficherAscTable(){
   const tb = document.getElementById('ascTableBody');
   tb.innerHTML = '';
-  ascActifs().forEach(a=>{
-    const nb = joueursActifs().filter(j=>j.asc_id===a.id && j.saison===SAISON_COURANTE).length;
+  DB.asc.forEach(a=>{
+    const nb = DB.joueurs.filter(j=>j.asc_id===a.id && j.saison===SAISON_COURANTE).length;
     const tr = document.createElement('tr');
     tr.innerHTML = `<td><b>${a.nom}</b></td><td>${a.couleurs||'—'}</td>
       <td>${(a.entraineur_prenom||'')+' '+(a.entraineur_nom||'')||'—'}</td>
@@ -752,7 +814,7 @@ function afficherAscTable(){
 function remplirSelectAsc(){
   const sel = document.getElementById('jAsc');
   sel.innerHTML = '';
-  const listeAsc = estSecretaire() ? ascActifs().filter(a=>a.id===monAscId()) : ascActifs();
+  const listeAsc = estSecretaire() ? DB.asc.filter(a=>a.id===monAscId()) : DB.asc;
   listeAsc.forEach(a=>{
     const o = document.createElement('option');
     o.value = a.id; o.textContent = a.nom;
@@ -761,7 +823,7 @@ function remplirSelectAsc(){
   if(estSecretaire() && listeAsc.length) sel.value = listeAsc[0].id;
   const filt = document.getElementById('filterAsc');
   filt.innerHTML = '<option value="">Toutes les ASC</option>';
-  ascActifs().forEach(a=>{
+  DB.asc.forEach(a=>{
     const o = document.createElement('option');
     o.value=a.id; o.textContent=a.nom;
     filt.appendChild(o);
@@ -965,10 +1027,10 @@ function cleJoueur(prenom, nom, ddn){
 }
 function trouverDoublonJoueur(prenom, nom, ddn, idExclu){
   const cle = cleJoueur(prenom, nom, ddn);
-  return joueursActifs().find(j => j.id !== idExclu && cleJoueur(j.prenom, j.nom, j.date_naissance) === cle);
+  return DB.joueurs.find(j => j.id !== idExclu && cleJoueur(j.prenom, j.nom, j.date_naissance) === cle);
 }
 
-async function enregistrerJoueur(){
+function enregistrerJoueur(){
   const msgBox = document.getElementById('joueurMsg');
   let ascId = parseInt(document.getElementById('jAsc').value);
   if(estSecretaire()) ascId = monAscId();
@@ -999,56 +1061,25 @@ async function enregistrerJoueur(){
   }
   const doublon = trouverDoublonJoueur(prenom, nom, ddn, null);
   if(doublon){
-    const ascExistante = ascActifs().find(a=>a.id===doublon.asc_id);
+    const ascExistante = DB.asc.find(a=>a.id===doublon.asc_id);
     const nomAscExistante = ascExistante ? ascExistante.nom : 'une autre ASC';
     msgBox.innerHTML = `<div class="alert err">⛔ Ce joueur est déjà enregistré (${doublon.prenom} ${doublon.nom}, né(e) le ${doublon.date_naissance}) sous l’ASC « ${nomAscExistante} ». Un joueur ne peut avoir qu’une seule licence, dans une seule ASC.</div>`;
     return;
   }
-  const nbActuel = joueursActifs().filter(j=>j.asc_id===ascId && j.saison===SAISON_COURANTE).length;
+  const nbActuel = DB.joueurs.filter(j=>j.asc_id===ascId && j.saison===SAISON_COURANTE).length;
   if(nbActuel >= JOUEURS_MAX){
     msgBox.innerHTML = `<div class="alert err">Effectif complet (max ${JOUEURS_MAX} joueurs).</div>`;
     return;
   }
 
-  if(!window.FB || !window.FB.uploadDataUrl){
-    msgBox.innerHTML = '<div class="alert err">Connexion au serveur non prête. Réessayez dans quelques secondes.</div>';
-    return;
-  }
-  const id = genererIdUnique();
-  const photoChemin = `joueurs/${id}/photo.jpg`;
-  const extraitChemin = `joueurs/${id}/extrait`;
-  const btnEnregistrer = document.querySelector('#panel-joueur .row-btn .btn:not(.secondary)');
-  if(btnEnregistrer){ btnEnregistrer.disabled = true; btnEnregistrer.textContent = '⏳ Envoi en cours…'; }
-  msgBox.innerHTML = '<div class="alert ok">⏳ Envoi de la photo et de l’extrait de naissance…</div>';
-  let photoUrl, extraitUrl;
-  try{
-    /* BUG CORRIGÉ : photo + PDF stockés en base64 dans le même
-       document Firestore (limite 1 Mo, dépassée à quelques
-       joueurs → échec silencieux de sync, surtout en mobile).
-       On les envoie maintenant à Firebase Storage ; seule
-       l'URL (courte) est enregistrée dans Firestore. */
-    [photoUrl, extraitUrl] = await Promise.all([
-      window.FB.uploadDataUrl(photoChemin, photoTemp),
-      window.FB.uploadDataUrl(extraitChemin, extraitTemp)
-    ]);
-  }catch(e){
-    console.error("Envoi photo/extrait échoué :", e);
-    msgBox.innerHTML = '<div class="alert err">❌ Échec de l’envoi de la photo ou de l’extrait. Vérifiez votre connexion et réessayez.</div>';
-    if(btnEnregistrer){ btnEnregistrer.disabled = false; btnEnregistrer.textContent = '💾 Enregistrer le joueur'; }
-    return;
-  }
-  if(btnEnregistrer){ btnEnregistrer.disabled = false; btnEnregistrer.textContent = '💾 Enregistrer le joueur'; }
-
   const joueur = {
-    id,
+    id: genererIdUnique(),
     asc_id: ascId,
     prenom, nom,
     date_naissance: ddn,
-    photo: photoUrl,
-    photo_chemin: photoChemin,
-    extrait_naissance: extraitUrl,
+    photo: photoTemp,
+    extrait_naissance: extraitTemp,
     extrait_naissance_nom: extraitNomTemp,
-    extrait_chemin: extraitChemin,
     saison: SAISON_COURANTE,
     categorie: "CADET",
     statut: "en_attente",
@@ -1056,7 +1087,7 @@ async function enregistrerJoueur(){
     updated_at: Date.now()
   };
   DB.joueurs.push(joueur);
-  sauverDB();
+  sauverDB({joueurs:[joueur.id]});
   const suite = estSecretaire() ? " Le dossier a été transmis à l'administrateur pour validation et génération de la licence." : "";
   msgBox.innerHTML = `<div class="alert ok">✅ ${prenom} ${nom} enregistré(e) avec succès ! Effectif : ${nbActuel+1}/${JOUEURS_MAX}.${suite}</div>`;
   effacerFormJoueur();
@@ -1079,11 +1110,11 @@ function effacerFormJoueur(){
 }
 function telechargerExtrait(id){
   const joueur = DB.joueurs.find(j=>j.id===id);
-  if(!joueur || !joueur.extrait_naissance){ alert("Aucun extrait de naissance enregistré pour ce joueur (supprimé après validation — voir l'onglet Historique)."); return; }
-  // Fichier hébergé sur Firebase Storage (URL externe) : l'attribut
-  // "download" ne force pas le téléchargement en cross-origin,
-  // on ouvre donc un nouvel onglet.
-  window.open(joueur.extrait_naissance, '_blank');
+  if(!joueur || !joueur.extrait_naissance){ alert("Aucun extrait de naissance enregistré pour ce joueur."); return; }
+  const lien = document.createElement('a');
+  lien.href = joueur.extrait_naissance;
+  lien.download = joueur.extrait_naissance_nom || `extrait_naissance_${joueur.nom}_${joueur.prenom}.pdf`;
+  lien.click();
 }
 
 
@@ -1094,11 +1125,11 @@ function afficherListeJoueurs(){
   const tb = document.getElementById('joueursTableBody');
   tb.innerHTML = '';
   const filtre = document.getElementById('filterAsc').value;
-  let liste = joueursActifs();
+  let liste = DB.joueurs;
   if(estSecretaire()) liste = liste.filter(j=>j.asc_id===monAscId());
   else if(filtre) liste = liste.filter(j=>j.asc_id===parseInt(filtre));
   liste.forEach(j=>{
-    const asc = ascActifs().find(a=>a.id===j.asc_id) || {nom:'?'};
+    const asc = DB.asc.find(a=>a.id===j.asc_id) || {nom:'?'};
     const badgeClass = j.statut==='valide'?'valide':(j.statut==='rejete'?'rejete':'attente');
     const tr = document.createElement('tr');
     const actions = estAdmin()
@@ -1107,7 +1138,7 @@ function afficherListeJoueurs(){
       : (j.statut==='en_attente' ? `<button class="btn rouge" onclick="supprimerJoueur(${j.id})">Suppr.</button>` : '<span style="color:#999;font-size:11px">Transmis à l’admin</span>');
     const extraitCell = j.extrait_naissance
       ? `<button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="telechargerExtrait(${j.id})">📄 PDF</button>`
-      : (j.statut==='valide' ? '<span style="color:#1a5c2e;font-size:11px">Archivé ✓</span>' : '<span style="color:#a32420;font-size:11px">Manquant</span>');
+      : '<span style="color:#a32420;font-size:11px">Manquant</span>';
     tr.innerHTML = `<td>${j.prenom} ${j.nom}</td><td>${asc.nom}</td><td>${j.date_naissance}</td>
       <td>${extraitCell}</td>
       <td><span class="badge ${badgeClass}">${j.statut.replace('_',' ')}</span></td>
@@ -1127,14 +1158,9 @@ function supprimerJoueur(id){
     alert("Ce joueur a déjà été transmis à l'administrateur et ne peut plus être supprimé.");
     return;
   }
-  joueur.deleted = true;
-  joueur.updated_at = Date.now();
-  sauverDB();
+  DB.joueurs = DB.joueurs.filter(j=>j.id!==id);
+  sauverDB({joueurs:[id]});
   afficherListeJoueurs(); afficherAscTable(); remplirSelectLicence(); rafraichirStats();
-  if(window.FB && window.FB.deleteFile){
-    if(joueur.photo_chemin) window.FB.deleteFile(joueur.photo_chemin);
-    if(joueur.extrait_chemin) window.FB.deleteFile(joueur.extrait_chemin);
-  }
 }
 function allerVersLicence(id){
   showPanel('licence');
@@ -1146,8 +1172,8 @@ function allerVersLicence(id){
    STATISTIQUES
    ========================================================= */
 function rafraichirStats(){
-  const joueurs = estSecretaire() ? joueursActifs().filter(j=>j.asc_id===monAscId()) : joueursActifs();
-  document.getElementById('statAsc').textContent = estSecretaire() ? 1 : ascActifs().length;
+  const joueurs = estSecretaire() ? DB.joueurs.filter(j=>j.asc_id===monAscId()) : DB.joueurs;
+  document.getElementById('statAsc').textContent = estSecretaire() ? 1 : DB.asc.length;
   document.getElementById('statJoueurs').textContent = joueurs.length;
   document.getElementById('statValides').textContent = joueurs.filter(j=>j.statut==='valide').length;
   document.getElementById('statAttente').textContent = joueurs.filter(j=>j.statut==='en_attente').length;
@@ -1173,7 +1199,7 @@ function enregistrerMonAsc(){
   asc.entraineur_prenom = document.getElementById('maAscEntPrenom').value.trim();
   asc.entraineur_nom = document.getElementById('maAscEntNom').value.trim();
   asc.updated_at = Date.now();
-  sauverDB();
+  sauverDB({asc:[asc.id]});
   msgBox.innerHTML = '<div class="alert ok">✅ Informations de l’ASC mises à jour.</div>';
   afficherAscTable();
 }
@@ -1185,9 +1211,9 @@ function afficherComptes(){
   if(!estAdmin()) return;
   const tb = document.getElementById('comptesTableBody');
   tb.innerHTML = '';
-  comptesActifs().forEach(c=>{
-    const asc = c.asc_id ? (ascActifs().find(a=>a.id===c.asc_id) || {nom:'—'}) : null;
-    const nbJoueurs = c.asc_id ? joueursActifs().filter(j=>j.asc_id===c.asc_id).length : '—';
+  DB.comptes.forEach(c=>{
+    const asc = c.asc_id ? (DB.asc.find(a=>a.id===c.asc_id) || {nom:'—'}) : null;
+    const nbJoueurs = c.asc_id ? DB.joueurs.filter(j=>j.asc_id===c.asc_id).length : '—';
     const tr = document.createElement('tr');
     tr.innerHTML = `<td><b>${c.login}</b></td>
       <td><span class="badge role-${c.role}">${c.role}</span></td>
@@ -1199,11 +1225,8 @@ function afficherComptes(){
 }
 function supprimerCompte(login){
   if(!confirm("Supprimer ce compte Secrétaire Général ? L'ASC et ses joueurs resteront enregistrés, mais le compte d'accès sera supprimé.")) return;
-  const compte = DB.comptes.find(c=>c.login===login);
-  if(!compte) return;
-  compte.deleted = true;
-  compte.updated_at = Date.now();
-  sauverDB();
+  DB.comptes = DB.comptes.filter(c=>c.login!==login);
+  sauverDB({comptes:true});
   afficherComptes();
 }
 
@@ -1214,8 +1237,8 @@ function remplirSelectLicence(){
   const sel = document.getElementById('licenceJoueur');
   const prevVal = sel.value;
   sel.innerHTML = '';
-  joueursActifs().forEach(j=>{
-    const asc = ascActifs().find(a=>a.id===j.asc_id) || {nom:'?'};
+  DB.joueurs.forEach(j=>{
+    const asc = DB.asc.find(a=>a.id===j.asc_id) || {nom:'?'};
     const o = document.createElement('option');
     o.value = j.id;
     o.textContent = `${j.prenom} ${j.nom} — ${asc.nom}`;
@@ -1249,7 +1272,7 @@ function dessinerDrapeauSenegal(ctx,x,y,w,h,border){
   ctx.closePath(); ctx.fill();
 }
 
-function dessinerLicenceSurCanvas(canvas, joueur, asc, onDone){
+function dessinerLicenceSurCanvas(canvas, joueur, asc){
   const ctx = canvas.getContext('2d');
   const W=850, H=540;
   ctx.clearRect(0,0,W,H);
@@ -1359,13 +1382,10 @@ function dessinerLicenceSurCanvas(canvas, joueur, asc, onDone){
       ctx.translate(W/2, H/2);
       ctx.fillText("ZONE 13C", 0, 0);
       ctx.restore();
-
-      if(typeof onDone === 'function') onDone();
     }
 
     if(joueur.photo){
       const img = new Image();
-      img.crossOrigin = 'anonymous'; // requis : la photo vient de Firebase Storage (CORS)
       img.onload = function(){
         ctx.drawImage(img, photoX, photoY, photoW, photoH);
         finPhoto();
@@ -1400,110 +1420,15 @@ function roundRect(ctx,x,y,w,h,r){
   ctx.closePath();
 }
 
-function afficherImageDansCanvas(canvas, url){
-  const ctx = canvas.getContext('2d');
-  const img = new Image();
-  img.crossOrigin = 'anonymous';
-  img.onload = function(){
-    ctx.clearRect(0,0,canvas.width,canvas.height);
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-  };
-  img.src = url;
-}
-
-/* =========================================================
-   HISTORIQUE DES LICENCES (archivage + réduction du stockage)
-   ========================================================= */
-function afficherHistorique(){
-  const tb = document.getElementById('historiqueTableBody');
-  if(!tb) return;
-  tb.innerHTML = '';
-  const liste = historiqueActifs().slice().sort((a,b)=>(b.created_at||0)-(a.created_at||0));
-  liste.forEach(h=>{
-    const tr = document.createElement('tr');
-    const dateStr = new Date(h.created_at||0).toLocaleDateString('fr-FR');
-    tr.innerHTML = `
-      <td><img src="${h.image_url}" style="width:70px;height:44px;object-fit:cover;border-radius:4px" crossorigin="anonymous"></td>
-      <td>${h.prenom} ${h.nom}</td>
-      <td>${h.asc_nom||'—'}</td>
-      <td>${h.numero_licence||'—'}</td>
-      <td>${h.saison||'—'}</td>
-      <td>${dateStr}</td>
-      <td class="actions"><button class="btn secondary" onclick="telechargerHistorique('${h.id}')">⬇️ Télécharger</button></td>`;
-    tb.appendChild(tr);
-  });
-}
-function telechargerHistorique(id){
-  const h = historiqueActifs().find(x=>x.id===id);
-  if(!h) return;
-  // Image hébergée sur Firebase Storage (URL externe) : nouvel onglet,
-  // l'attribut "download" ne force pas en cross-origin.
-  window.open(h.image_url, '_blank');
-}
-
-/* Génère l'image finale de la licence, l'archive dans l'historique,
-   puis supprime les fichiers bruts (photo + extrait) du stockage —
-   c'est ce qui réduit le volume de fichiers conservés. */
-async function archiverLicence(joueur, noSave){
-  if(!window.FB || !window.FB.uploadDataUrl) return;
-  const asc = ascActifs().find(a=>a.id===joueur.asc_id) || {nom:'—'};
-  const canvasTmp = document.createElement('canvas');
-  canvasTmp.width = 850; canvasTmp.height = 540;
-  try{
-    await new Promise((resolve, reject)=>{
-      try{ dessinerLicenceSurCanvas(canvasTmp, joueur, asc, resolve); }
-      catch(e){ reject(e); }
-    });
-    const dataUrl = canvasTmp.toDataURL('image/png');
-    const chemin = `historique/${joueur.numero_licence}.png`;
-    const url = await window.FB.uploadDataUrl(chemin, dataUrl);
-
-    DB.historique.push({
-      id: genererIdUnique(),
-      joueur_id: joueur.id,
-      numero_licence: joueur.numero_licence,
-      prenom: joueur.prenom, nom: joueur.nom,
-      asc_id: joueur.asc_id, asc_nom: asc.nom,
-      saison: joueur.saison,
-      image_url: url,
-      image_chemin: chemin,
-      created_at: Date.now(),
-      updated_at: Date.now()
-    });
-
-    // Fichiers bruts devenus inutiles : la carte archivée suffit désormais.
-    if(joueur.photo_chemin) window.FB.deleteFile(joueur.photo_chemin);
-    if(joueur.extrait_chemin) window.FB.deleteFile(joueur.extrait_chemin);
-    joueur.photo = url;
-    joueur.photo_chemin = null;
-    joueur.extrait_naissance = null;
-    joueur.extrait_chemin = null;
-    joueur.updated_at = Date.now();
-    if(!noSave){
-      sauverDB();
-      afficherListeJoueurs();
-    }
-  }catch(e){
-    console.error("Archivage de la licence échoué :", e);
-    majStatutSync('Échec archivage licence');
-  }
-}
-
 function genererApercu(){
   const id = parseInt(document.getElementById('licenceJoueur').value);
   const joueur = DB.joueurs.find(j=>j.id===id);
   if(!joueur) return;
-  const canvas = document.getElementById('canvaLicence');
-  const archive = joueur.numero_licence ? historiqueActifs().find(h=>h.numero_licence===joueur.numero_licence) : null;
-  if(archive){
-    afficherImageDansCanvas(canvas, archive.image_url);
-    return;
-  }
-  const asc = ascActifs().find(a=>a.id===joueur.asc_id) || {nom:'—'};
-  dessinerLicenceSurCanvas(canvas, joueur, asc);
+  const asc = DB.asc.find(a=>a.id===joueur.asc_id) || {nom:'—'};
+  dessinerLicenceSurCanvas(document.getElementById('canvaLicence'), joueur, asc);
 }
 
-async function validerJoueurCourant(){
+function validerJoueurCourant(){
   const id = parseInt(document.getElementById('licenceJoueur').value);
   const joueur = DB.joueurs.find(j=>j.id===id);
   if(!joueur) return;
@@ -1512,18 +1437,14 @@ async function validerJoueurCourant(){
   }
   joueur.statut = 'valide';
   joueur.updated_at = Date.now();
-  sauverDB();
-  afficherListeJoueurs(); rafraichirStats();
-  await archiverLicence(joueur);
-  genererApercu();
+  sauverDB({joueurs:[joueur.id]});
+  afficherListeJoueurs(); rafraichirStats(); genererApercu();
 }
 
 function telechargerLicence(){
   const id = parseInt(document.getElementById('licenceJoueur').value);
   const joueur = DB.joueurs.find(j=>j.id===id);
   if(!joueur){ alert("Choisissez un joueur."); return; }
-  const archive = joueur.numero_licence ? historiqueActifs().find(h=>h.numero_licence===joueur.numero_licence) : null;
-  if(archive){ window.open(archive.image_url, '_blank'); return; }
   const canvas = document.getElementById('canvaLicence');
   const lien = document.createElement('a');
   const nomFichier = `licence_${(joueur.numero_licence||'tmp').replace(/-/g,'_')}.png`;
@@ -1546,69 +1467,64 @@ function importerDonnees(e){
   const file = e.target.files[0];
   if(!file) return;
   const reader = new FileReader();
-  reader.onload = async function(ev){
+  reader.onload = function(ev){
     try{
       const data = JSON.parse(ev.target.result);
       if(!data.asc || !data.joueurs || !data.comptes){ throw new Error("format invalide"); }
-      if(!data.historique) data.historique = []; // compatibilité anciennes sauvegardes
 
-      /* MIGRATION : les anciennes sauvegardes stockent la photo et
-         l'extrait de naissance en base64 directement dans le JSON
-         (c'est ce qui dépassait la limite de 1 Mo par document
-         Firestore). On les envoie vers Firebase Storage avant
-         d'importer — comme pour un nouvel enregistrement — et on
-         archive directement les licences déjà validées, exactement
-         comme le fait la validation normale. */
-      const brut = j => j && typeof j === 'string' && j.startsWith('data:');
-      const joueursBruts = data.joueurs.filter(j => brut(j.photo) || brut(j.extrait_naissance));
+      const { joueurs: joueursNettoyes, nbDoublons } = dedoublonnerJoueurs(data.joueurs);
+      data.joueurs = joueursNettoyes;
 
-      if(joueursBruts.length){
-        if(!window.FB || !window.FB.uploadDataUrl){
-          alert("Connexion au serveur non prête. Réessayez dans quelques secondes.");
-          e.target.value='';
-          return;
-        }
-        DB = data; // nécessaire pour que ascActifs()/DB.asc soient corrects pendant la migration
-        for(let i=0;i<joueursBruts.length;i++){
-          const j = joueursBruts[i];
-          majStatutSync(`Migration des fichiers… (${i+1}/${joueursBruts.length})`);
-          if(j.statut === 'valide' && j.numero_licence){
-            // Déjà validé : on archive directement la carte finale
-            // (elle contient la photo) et on jette le brut.
-            await archiverLicence(j, true);
-          } else {
-            if(brut(j.photo)){
-              const chemin = `joueurs/${j.id}/photo.jpg`;
-              j.photo = await window.FB.uploadDataUrl(chemin, j.photo);
-              j.photo_chemin = chemin;
-            }
-            if(brut(j.extrait_naissance)){
-              const chemin = `joueurs/${j.id}/extrait`;
-              j.extrait_naissance = await window.FB.uploadDataUrl(chemin, j.extrait_naissance);
-              j.extrait_chemin = chemin;
-            }
-          }
-        }
-      } else {
-        DB = data;
-      }
+      const now = Date.now();
+      data.asc.forEach(a=>{ if(!a.updated_at) a.updated_at = now; });
+      data.joueurs.forEach(j=>{ if(!j.updated_at) j.updated_at = now; });
+      data.comptes.forEach(c=>{ if(!c.updated_at) c.updated_at = now; });
+      delete data.nextAscId; delete data.nextJoueurId;
 
-      sauverDB();
+      DB = data;
+      sauverDB({full:true});
       rafraichirTout();
-      majStatutSync('Synchronisé ✓');
-      alert(`✅ Données importées avec succès${joueursBruts.length ? ' (' + joueursBruts.length + ' dossier(s) migré(s) vers le stockage distant).' : '.'}`);
+      const msgDoublons = nbDoublons > 0 ? `\n${nbDoublons} doublon(s) fusionné(s)/écrasé(s) automatiquement.` : "";
+      alert("✅ Données importées avec succès." + msgDoublons);
     }catch(err){
-      console.error(err);
       alert("❌ Fichier invalide : " + err.message);
     }
   };
   reader.readAsText(file);
 }
+
+/* Écrase les doublons (même joueur : prénom+nom+date de naissance) détectés
+   dans un fichier importé. Priorité conservée : statut "valide" > "en_attente",
+   puis, à égalité, l'enregistrement le plus récent (updated_at). */
+function dedoublonnerJoueurs(liste){
+  const parCle = new Map();
+  let nbDoublons = 0;
+  (liste||[]).forEach(j=>{
+    const cle = cleJoueur(j.prenom, j.nom, j.date_naissance);
+    const existant = parCle.get(cle);
+    if(!existant){
+      parCle.set(cle, j);
+      return;
+    }
+    nbDoublons++;
+    const scoreExistant = (existant.statut==='valide' ? 2 : 1) + (existant.numero_licence ? 1 : 0);
+    const scoreNouveau = (j.statut==='valide' ? 2 : 1) + (j.numero_licence ? 1 : 0);
+    if(scoreNouveau > scoreExistant){
+      parCle.set(cle, j);
+    } else if(scoreNouveau === scoreExistant && (j.updated_at||0) > (existant.updated_at||0)){
+      parCle.set(cle, j);
+    }
+    // sinon on garde l'existant (déjà meilleur ou plus récent)
+  });
+  return { joueurs: Array.from(parCle.values()), nbDoublons };
+}
 </script>
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-app.js";
-  import { getFirestore, doc, getDoc, runTransaction, onSnapshot } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore.js";
-  import { getStorage, ref as storageRef, uploadString, getDownloadURL, deleteObject } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-storage.js";
+  import {
+    getFirestore, collection, doc, getDoc, getDocs, setDoc,
+    onSnapshot, writeBatch, enableIndexedDbPersistence
+  } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyCNuLvy5mnSUv7JaxbHHPx7l8H-pe1q8jo",
@@ -1622,39 +1538,28 @@ function importerDonnees(e){
 
   const app = initializeApp(firebaseConfig);
   const firestore = getFirestore(app);
-  const storage = getStorage(app);
-  const docRef = doc(firestore, "zone13c_cadets", "db");
+
+  // Persistance hors-ligne : sur mobile (réseau instable / app mise en arrière-plan),
+  // les lectures/écritures sont mises en cache et rejouées automatiquement au retour du réseau.
+  enableIndexedDbPersistence(firestore).catch((err)=>{
+    console.warn("Persistance hors-ligne non activée :", err.code);
+  });
+
+  // Un document Firestore par ASC et par joueur (au lieu d'un seul gros document)
+  // pour ne jamais dépasser la limite de 1 Mo par document et éviter les conflits
+  // d'écriture entre plusieurs téléphones utilisés en même temps.
+  const ascCol = collection(firestore, "zone13c_asc");
+  const joueursCol = collection(firestore, "zone13c_joueurs");
+  const metaRef = doc(firestore, "zone13c_meta", "comptes");
 
   window.FB = {
-    docRef,
+    ascCol, joueursCol, metaRef,
+    doc: (col, id) => doc(col, id),
     getDoc: (ref) => getDoc(ref),
-    onSnapshot: (ref, next, error) => onSnapshot(ref, next, error),
-
-    /* BUG CORRIGÉ : lecture + écriture séparées (getDoc puis
-       setDoc) laissaient une fenêtre où un autre téléphone
-       pouvait écrire entre les deux → écriture non atomique,
-       conflits possibles. runTransaction relit et réécrit de
-       façon atomique côté serveur, avec re-tentative automatique
-       en cas d'écriture concurrente. */
-    fusionEtEcrire: (mergeFn, localData) => runTransaction(firestore, async (tx) => {
-      const snap = await tx.get(docRef);
-      const distant = (snap.exists() && snap.data().data) ? JSON.parse(snap.data().data) : null;
-      const fusion = mergeFn(localData, distant);
-      tx.set(docRef, { data: JSON.stringify(fusion), updatedAt: Date.now() });
-      return fusion;
-    }),
-
-    /* Stocke la photo/le PDF dans Firebase Storage au lieu du
-       document Firestore (limite 1 Mo) ; renvoie l'URL. */
-    uploadDataUrl: async (chemin, dataUrl) => {
-      const r = storageRef(storage, chemin);
-      await uploadString(r, dataUrl, 'data_url');
-      return getDownloadURL(r);
-    },
-    deleteFile: async (chemin) => {
-      try{ await deleteObject(storageRef(storage, chemin)); }
-      catch(e){ console.warn('Suppression fichier Storage échouée :', e); }
-    }
+    getDocs: (col) => getDocs(col),
+    setDoc: (ref, data) => setDoc(ref, data),
+    onSnapshotCol: (col, next, error) => onSnapshot(col, next, error),
+    batch: () => writeBatch(firestore)
   };
 
   if(window.initFirebaseSync){
