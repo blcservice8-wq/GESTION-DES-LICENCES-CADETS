@@ -361,6 +361,7 @@
         </div>
         <div class="row-btn" style="margin-bottom:14px">
           <button class="btn secondary" onclick="purgerLicencesDejaGenerees()">🗑️ Libérer l'espace (licences déjà validées/générées)</button>
+          <button class="btn secondary" onclick="corrigerNumerotationLicences()">🛠️ Corriger la numérotation</button>
         </div>
         <table>
           <thead><tr>
@@ -1005,9 +1006,89 @@ function calcAge(ddn){
   }
   return age;
 }
-function genererNumeroLicence(ascId, joueurId){
+/* Le numéro de licence utilisait auparavant joueur.id (identifiant unique
+   anti-collision, ex. "mtemgixguk25er") directement comme suffixe "J",
+   ce qui produisait des numéros illisibles et désordonnés dès qu'un joueur
+   était créé après la mise en place de cet identifiant. Le numéro "J" doit
+   être un compteur séquentiel, indépendant de l'identifiant interne du
+   joueur : on le calcule à partir du plus grand numéro déjà attribué. */
+function prochainNumeroSequence(){
+  let max = 0;
+  DB.joueurs.forEach(j=>{
+    const m = /-J(\d+)$/.exec(j.numero_licence||'');
+    if(m){ const n = parseInt(m[1],10); if(!isNaN(n) && n>max) max = n; }
+  });
+  return max+1;
+}
+function genererNumeroLicence(ascId, sequence){
   const annee = new Date().getFullYear();
-  return `Z13C-${annee}-ASC${String(ascId).padStart(4,'0')}-J${String(joueurId).padStart(4,'0')}`;
+  return `Z13C-${annee}-ASC${String(ascId).padStart(4,'0')}-J${String(sequence).padStart(4,'0')}`;
+}
+
+/* =========================================================
+   RÉPARATION DE LA NUMÉROTATION (licences déjà attribuées avec
+   l'ancien bug : suffixes illisibles ou numéros en double).
+   Ne touche PAS aux numéros déjà propres et uniques — seulement
+   ceux malformés ou en doublon, renumérotés à la suite dans
+   l'ordre chronologique de validation établi.
+   ========================================================= */
+function corrigerNumerotationLicences(){
+  if(!estAdmin()) return;
+  const regexPropre = /^Z13C-\d{4}-ASC\d{4}-J(\d+)$/;
+  const groupes = new Map(); // numéro J -> [joueurs qui l'utilisent]
+  DB.joueurs.forEach(j=>{
+    if(!j.numero_licence) return;
+    const m = regexPropre.exec(j.numero_licence);
+    if(!m) return;
+    const n = parseInt(m[1],10);
+    if(!groupes.has(n)) groupes.set(n, []);
+    groupes.get(n).push(j);
+  });
+
+  let maxPropre = 0;
+  const aCorriger = [];
+
+  DB.joueurs.forEach(j=>{
+    if(!j.numero_licence) return;
+    const m = regexPropre.exec(j.numero_licence);
+    if(!m){ aCorriger.push(j); return; } // format invalide (ancien identifiant illisible)
+    const n = parseInt(m[1],10);
+    const groupe = groupes.get(n);
+    if(groupe.length > 1){
+      // Doublon : on garde le joueur validé le plus tôt, les autres sont renumérotés
+      const plusAncien = groupe.slice().sort((a,b)=>(a.date_validation||a.updated_at||0)-(b.date_validation||b.updated_at||0))[0];
+      if(j !== plusAncien){ aCorriger.push(j); return; }
+    }
+    if(n > maxPropre) maxPropre = n;
+  });
+
+  if(aCorriger.length === 0){
+    alert("Numérotation déjà correcte : aucune licence à corriger.");
+    return;
+  }
+
+  const detail = aCorriger.map(j=>`• ${j.prenom} ${j.nom} — ${j.numero_licence || '(aucun numéro)'}`).join('\n');
+  const confirme = confirm(
+    `${aCorriger.length} licence(s) mal numérotée(s) détectée(s) :\n\n${detail}\n\n` +
+    `Elles vont être renumérotées à la suite (à partir de J${String(maxPropre+1).padStart(4,'0')}), ` +
+    `dans l'ordre chronologique de validation établi. Continuer ?`
+  );
+  if(!confirme) return;
+
+  aCorriger.sort((a,b)=>(a.date_validation||a.updated_at||0)-(b.date_validation||b.updated_at||0));
+
+  let compteur = maxPropre;
+  const idsModifies = [];
+  aCorriger.forEach(j=>{
+    compteur++;
+    j.numero_licence = genererNumeroLicence(j.asc_id, compteur);
+    j.updated_at = Date.now();
+    idsModifies.push(j.id);
+  });
+
+  sauverDB({joueurs:idsModifies});
+  afficherListeJoueurs(); afficherHistorique(); rafraichirStats();
+  alert(`${aCorriger.length} licence(s) corrigée(s) et renumérotée(s) dans l'ordre chronologique.`);
 }
 
 /* =========================================================
@@ -1868,7 +1949,7 @@ function validerJoueurCourant(){
   const joueur = DB.joueurs.find(j=>j.id===id);
   if(!joueur) return;
   if(!joueur.numero_licence){
-    joueur.numero_licence = genererNumeroLicence(joueur.asc_id, joueur.id);
+    joueur.numero_licence = genererNumeroLicence(joueur.asc_id, prochainNumeroSequence());
     joueur.date_generation = Date.now();
   }
   joueur.statut = 'valide';
