@@ -1059,7 +1059,7 @@ function afficherAscTable(){
     tr.innerHTML = `<td><b>${a.nom}</b></td><td>${a.couleurs||'—'}</td>
       <td>${(a.entraineur_prenom||'')+' '+(a.entraineur_nom||'')||'—'}</td>
       <td>${nb}/${JOUEURS_MAX}</td>
-      <td class="actions"><button class="btn rouge" onclick="supprimerAsc(${a.id})">Suppr.</button></td>`;
+      <td class="actions"><button class="btn rouge" onclick="supprimerAsc('${a.id}')">Suppr.</button></td>`;
     tb.appendChild(tr);
   });
 }
@@ -1459,19 +1459,24 @@ function afficherListeJoueurs(){
   if(estSecretaire()) liste = liste.filter(j=>j.asc_id===monAscId());
   else if(filtre) liste = liste.filter(j=>j.asc_id===filtre);
   liste.forEach(j=>{
-    const asc = DB.asc.find(a=>a.id===j.asc_id) || {nom:'?'};
+    const asc = DB.asc.find(a=>a.id===j.asc_id);
+    const ascOrpheline = !asc; // ASC introuvable : donnée corrompue par un ancien bug d'ID
     const badgeClass = j.statut==='valide'?'valide':(j.statut==='rejete'?'rejete':'attente');
     const tr = document.createElement('tr');
-    const actions = estAdmin()
-      ? `<button class="btn" onclick="allerVersLicence(${j.id})">🪪 Licence</button>
-         <button class="btn rouge" onclick="supprimerJoueur(${j.id})">Suppr.</button>`
-      : (j.statut==='en_attente' ? `<button class="btn rouge" onclick="supprimerJoueur(${j.id})">Suppr.</button>` : '<span style="color:#999;font-size:11px">Transmis à l’admin</span>');
+    let actions = estAdmin()
+      ? `<button class="btn" onclick="allerVersLicence('${j.id}')">🪪 Licence</button>
+         <button class="btn rouge" onclick="supprimerJoueur('${j.id}')">Suppr.</button>`
+      : (j.statut==='en_attente' ? `<button class="btn rouge" onclick="supprimerJoueur('${j.id}')">Suppr.</button>` : '<span style="color:#999;font-size:11px">Transmis à l’admin</span>');
+    if(ascOrpheline && estAdmin()){
+      actions = `<button class="btn jaune" style="color:#1a1a1a" onclick="reparerAscJoueur('${j.id}')">🔧 Corriger l'ASC</button> ` + actions;
+    }
     const extraitCell = j.extrait_naissance
-      ? `<button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="telechargerExtrait(${j.id})">📄 PDF</button>`
+      ? `<button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="telechargerExtrait('${j.id}')">📄 PDF</button>`
       : (j.pieces_jointes_purgees
           ? '<span style="color:#8a9a8a;font-size:11px" title="Supprimé après validation et génération de la licence, pour réduire le stockage">🗑️ Allégé</span>'
           : '<span style="color:#a32420;font-size:11px">Manquant</span>');
-    tr.innerHTML = `<td>${j.prenom} ${j.nom}</td><td>${asc.nom}</td><td>${j.date_naissance}</td>
+    const nomAsc = ascOrpheline ? '<span style="color:#a32420" title="ASC introuvable — donnée à corriger">⚠️ ASC inconnue</span>' : asc.nom;
+    tr.innerHTML = `<td>${j.prenom} ${j.nom}</td><td>${nomAsc}</td><td>${j.date_naissance}</td>
       <td>${extraitCell}</td>
       <td><span class="badge ${badgeClass}">${j.statut.replace('_',' ')}</span></td>
       <td>${j.numero_licence||'—'}</td>
@@ -1479,6 +1484,28 @@ function afficherListeJoueurs(){
     tb.appendChild(tr);
   });
 }
+/* Répare un joueur dont l'asc_id ne correspond à aucune ASC existante —
+   séquelle de l'ancien bug qui appliquait parseInt() aux identifiants
+   texte (asc_id devenait NaN, donc null une fois sauvegardé en JSON). */
+function reparerAscJoueur(id){
+  const joueur = DB.joueurs.find(j=>j.id===id);
+  if(!joueur) return;
+  const options = DB.asc.map(a=>`${a.nom} (${a.id})`).join('\n');
+  const choix = prompt(
+    `Ce joueur (${joueur.prenom} ${joueur.nom}) n'est rattaché à aucune ASC valide.\n`+
+    `À quelle ASC appartient-il réellement ? Tapez EXACTEMENT le nom ci-dessous :\n\n${DB.asc.map(a=>a.nom).join('\n')}`
+  );
+  if(!choix) return;
+  const asc = DB.asc.find(a=>a.nom.trim().toLowerCase()===choix.trim().toLowerCase());
+  if(!asc){ alert("Nom d'ASC non reconnu. Aucune modification effectuée."); return; }
+  joueur.asc_id = asc.id;
+  joueur.updated_at = Date.now();
+  sauverDB({joueurs:[joueur.id]});
+  afficherListeJoueurs(); afficherAscTable(); remplirSelectLicence(); rafraichirStats();
+  alert(`✅ ${joueur.prenom} ${joueur.nom} rattaché(e) à ${asc.nom}.`);
+}
+window.reparerAscJoueur = reparerAscJoueur;
+
 function supprimerJoueur(id){
   if(!confirm("Supprimer ce joueur ?")) return;
   const joueur = DB.joueurs.find(j=>j.id===id);
@@ -1531,13 +1558,13 @@ function afficherHistorique(){
     const pretCell = j.pret_impression
       ? `✅ ${formaterDate(j.date_impression)}`
       : '<span style="color:#999">—</span>';
-    let actions = `<button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="allerVersLicence(${j.id})">🪪 Voir</button>`;
+    let actions = `<button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="allerVersLicence('${j.id}')">🪪 Voir</button>`;
     if(j.statut==='valide'){
       actions += j.pret_impression
-        ? ` <button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="annulerPretImpression(${j.id})">↩️ Annuler</button>`
-        : ` <button class="btn jaune" style="padding:5px 8px;font-size:11px;color:#1a1a1a" onclick="marquerPretImpression(${j.id})">🖨️ Prêt à imprimer</button>`;
+        ? ` <button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="annulerPretImpression('${j.id}')">↩️ Annuler</button>`
+        : ` <button class="btn jaune" style="padding:5px 8px;font-size:11px;color:#1a1a1a" onclick="marquerPretImpression('${j.id}')">🖨️ Prêt à imprimer</button>`;
       if(j.photo || j.extrait_naissance){
-        actions += ` <button class="btn rouge" style="padding:5px 8px;font-size:11px" onclick="purgerJoueurUnique(${j.id})" title="Supprimer la photo/extrait de ce joueur pour libérer l'espace">🗑️</button>`;
+        actions += ` <button class="btn rouge" style="padding:5px 8px;font-size:11px" onclick="purgerJoueurUnique('${j.id}')" title="Supprimer la photo/extrait de ce joueur pour libérer l'espace">🗑️</button>`;
       } else if(j.pieces_jointes_purgees){
         actions += ` <span style="color:#8a9a8a;font-size:11px" title="Photo/extrait déjà supprimés">✓ Allégé</span>`;
       }
