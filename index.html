@@ -193,6 +193,7 @@
         <div class="stat-box"><div class="num" id="statValides">0</div><div class="lbl">Licences validées</div></div>
         <div class="stat-box"><div class="num" id="statPrete">0</div><div class="lbl">Prêtes à l'impression</div></div>
         <div class="stat-box"><div class="num" id="statAttente">0</div><div class="lbl">En attente</div></div>
+        <div class="stat-box"><div class="num" id="statRejetes">0</div><div class="lbl">Rejetés</div></div>
       </div>
       <div class="card">
         <h2>Bienvenue</h2>
@@ -365,7 +366,7 @@
         </div>
         <table>
           <thead><tr>
-            <th>Joueur</th><th>ASC</th><th>N° Licence</th>
+            <th>Joueur</th><th>ASC</th><th>Statut</th><th>N° Licence</th>
             <th>Générée le</th><th>Validée le</th><th>Prête à l'impression</th><th>Actions</th>
           </tr></thead>
           <tbody id="historiqueTableBody"></tbody>
@@ -377,7 +378,7 @@
     <div class="panel" id="panel-comptes">
       <div class="card">
         <h2>Comptes Secrétaires Généraux d'ASC</h2>
-        <p style="font-size:13px;color:#555">Liste des comptes créés par les Secrétaires Généraux des ASC. Chaque compte a un accès limité : ouverture/gestion de son ASC, enregistrement des joueurs de son ASC. Seul l'administrateur peut valider les joueurs et générer les licences.</p>
+        <p style="font-size:13px;color:#555">Liste des comptes créés par les Secrétaires Généraux des ASC. Chaque nouvelle demande de compte a le statut « en attente » et doit être validée ici avant que le Secrétaire Général puisse se connecter. Une fois validé, chaque compte a un accès limité : ouverture/gestion de son ASC, enregistrement des joueurs de son ASC. Seul l'administrateur peut valider ou rejeter les joueurs et générer les licences.</p>
         <table>
           <thead><tr><th>Identifiant</th><th>Rôle</th><th>ASC liée</th><th>Joueurs soumis</th><th>Actions</th></tr></thead>
           <tbody id="comptesTableBody"></tbody>
@@ -405,11 +406,11 @@ function chargerDB(){
   let raw = localStorage.getItem(DB_KEY);
   let db;
   if(!raw){
-    db = { comptes: [{login:"admin", pwd:"admin123", role:"admin"}], asc: [], joueurs: [] };
+    db = { comptes: [{login:"admin", pwd:"zone13c", role:"admin"}], asc: [], joueurs: [] };
     localStorage.setItem(DB_KEY, JSON.stringify(db));
   } else {
     db = JSON.parse(raw);
-    if(!db.comptes) db.comptes = [{login:"admin", pwd:"admin123", role:"admin"}];
+    if(!db.comptes) db.comptes = [{login:"admin", pwd:"zone13c", role:"admin"}];
     if(!db.asc) db.asc = [];
     if(!db.joueurs) db.joueurs = [];
   }
@@ -859,14 +860,22 @@ let extraitNomTemp = null; // nom du fichier PDF temporaire
 /* =========================================================
    CONNEXION
    ========================================================= */
+function afficherMessageLogin(texte, type){
+  const msg = document.getElementById('loginMsg');
+  msg.style.display = 'block';
+  msg.className = 'alert ' + (type||'err');
+  msg.textContent = texte;
+}
 function seConnecter(){
   const login = document.getElementById('loginUser').value.trim();
   const pwd = document.getElementById('loginPwd').value;
   const compte = DB.comptes.find(c => c.login === login && c.pwd === pwd);
-  const msg = document.getElementById('loginMsg');
   if(!compte){
-    msg.style.display='block';
-    msg.textContent = "Identifiant ou mot de passe incorrect.";
+    afficherMessageLogin("Identifiant ou mot de passe incorrect.", 'err');
+    return;
+  }
+  if(compte.role==='secretaire' && compte.statut==='en_attente'){
+    afficherMessageLogin("⏳ Votre compte est en attente de validation par l'administrateur. Réessayez plus tard.", 'err');
     return;
   }
   utilisateurCourant = compte;
@@ -928,14 +937,18 @@ function creerCompteAsc(){
 
   const asc = {id:genererIdUnique(), nom:ascNom, couleurs, entraineur_prenom:entP, entraineur_nom:entN, actif:1, updated_at:Date.now()};
   DB.asc.push(asc);
-  DB.comptes.push({login, pwd, role:"secretaire", asc_id: asc.id, updated_at:Date.now()});
+  DB.comptes.push({login, pwd, role:"secretaire", asc_id: asc.id, statut:"en_attente", updated_at:Date.now()});
   sauverDB({asc:[asc.id], comptes:true});
 
-  // Connexion automatique du nouveau Secrétaire Général
+  // Pas de connexion automatique : le compte doit d'abord être validé par l'administrateur
+  // (panneau "Comptes"). Le Secrétaire Général ne pourra se connecter qu'une fois validé.
   retourLogin();
-  document.getElementById('loginUser').value = login;
-  document.getElementById('loginPwd').value = pwd;
-  seConnecter();
+  document.getElementById('loginUser').value = '';
+  document.getElementById('loginPwd').value = '';
+  afficherMessageLogin(
+    `✅ Demande envoyée pour l'ASC « ${ascNom} ». Un administrateur doit encore valider votre compte avant que vous puissiez vous connecter.`,
+    'ok'
+  );
 }
 
 /* =========================================================
@@ -1001,9 +1014,7 @@ function calcAge(ddn){
   if(isNaN(n)) return -1;
   const t = new Date();
   let age = t.getFullYear() - n.getFullYear();
-  if((t.getMonth(), t.getDate()) < (n.getMonth(), n.getDate())){
-    if(t.getMonth() < n.getMonth() || (t.getMonth()===n.getMonth() && t.getDate()<n.getDate())) age--;
-  }
+  if(t.getMonth() < n.getMonth() || (t.getMonth()===n.getMonth() && t.getDate()<n.getDate())) age--;
   return age;
 }
 /* Le numéro de licence utilisait auparavant joueur.id (identifiant unique
@@ -1543,11 +1554,24 @@ function afficherListeJoueurs(){
     const asc = DB.asc.find(a=>a.id===j.asc_id);
     const ascOrpheline = !asc; // ASC introuvable : donnée corrompue par un ancien bug d'ID
     const badgeClass = j.statut==='valide'?'valide':(j.statut==='rejete'?'rejete':'attente');
+    const badgeTitle = (j.statut==='rejete' && j.motif_rejet) ? ` title="Motif du rejet : ${j.motif_rejet.replace(/"/g,'&quot;')}"` : '';
     const tr = document.createElement('tr');
-    let actions = estAdmin()
-      ? `<button class="btn" onclick="allerVersLicence('${j.id}')">🪪 Licence</button>
-         <button class="btn rouge" onclick="supprimerJoueur('${j.id}')">Suppr.</button>`
-      : (j.statut==='en_attente' ? `<button class="btn rouge" onclick="supprimerJoueur('${j.id}')">Suppr.</button>` : '<span style="color:#999;font-size:11px">Transmis à l’admin</span>');
+    let actions;
+    if(estAdmin()){
+      actions = `<button class="btn" onclick="allerVersLicence('${j.id}')">🪪 Licence</button>`;
+      if(j.statut==='en_attente'){
+        actions += ` <button class="btn rouge" onclick="rejeterJoueur('${j.id}')">✖ Rejeter</button>`;
+      } else if(j.statut==='rejete'){
+        actions += ` <button class="btn secondary" onclick="remettreEnAttente('${j.id}')">↩️ Remettre en attente</button>`;
+      }
+      actions += ` <button class="btn rouge" onclick="supprimerJoueur('${j.id}')">Suppr.</button>`;
+    } else {
+      if(j.statut==='en_attente' || j.statut==='rejete'){
+        actions = `<button class="btn rouge" onclick="supprimerJoueur('${j.id}')">Suppr.</button>`;
+      } else {
+        actions = '<span style="color:#999;font-size:11px">Transmis à l’admin</span>';
+      }
+    }
     if(ascOrpheline && estAdmin()){
       actions = `<button class="btn jaune" style="color:#1a1a1a" onclick="reparerAscJoueur('${j.id}')">🔧 Corriger l'ASC</button> ` + actions;
     }
@@ -1559,7 +1583,7 @@ function afficherListeJoueurs(){
     const nomAsc = ascOrpheline ? '<span style="color:#a32420" title="ASC introuvable — donnée à corriger">⚠️ ASC inconnue</span>' : asc.nom;
     tr.innerHTML = `<td>${j.prenom} ${j.nom}</td><td>${nomAsc}</td><td>${j.date_naissance}</td>
       <td>${extraitCell}</td>
-      <td><span class="badge ${badgeClass}">${j.statut.replace('_',' ')}</span></td>
+      <td><span class="badge ${badgeClass}"${badgeTitle}>${j.statut.replace('_',' ')}</span></td>
       <td>${j.numero_licence||'—'}</td>
       <td class="actions">${actions}</td>`;
     tb.appendChild(tr);
@@ -1594,8 +1618,8 @@ function supprimerJoueur(id){
     alert("Vous ne pouvez supprimer que les joueurs de votre propre ASC.");
     return;
   }
-  if(estSecretaire() && joueur.statut!=='en_attente'){
-    alert("Ce joueur a déjà été transmis à l'administrateur et ne peut plus être supprimé.");
+  if(estSecretaire() && joueur.statut!=='en_attente' && joueur.statut!=='rejete'){
+    alert("Ce joueur a déjà été validé et ne peut plus être supprimé depuis cet écran.");
     return;
   }
   DB.joueurs = DB.joueurs.filter(j=>j.id!==id);
@@ -1607,6 +1631,60 @@ function allerVersLicence(id){
   document.getElementById('licenceJoueur').value = id;
   genererApercu();
 }
+
+/* =========================================================
+   REJET D'UN DOSSIER (ADMIN)
+   ---------------------------------------------------------
+   Un dossier "en_attente" peut être rejeté par l'admin avec un
+   motif obligatoire (photo illisible, extrait non conforme, âge
+   hors catégorie, etc.). Le joueur passe alors au statut "rejete",
+   visible dans la liste des joueurs ET dans l'historique, avec le
+   motif affiché en infobulle sur le badge. Contrairement à une
+   suppression, le dossier reste tracé. L'admin peut aussi revenir
+   en arrière ("Remettre en attente") si le rejet était une erreur,
+   et le Secrétaire Général peut supprimer un dossier rejeté pour
+   le corriger et le resoumettre.
+   ========================================================= */
+function rejeterJoueur(id){
+  if(!estAdmin()) return;
+  const joueur = DB.joueurs.find(j=>j.id===id);
+  if(!joueur){ alert("Joueur introuvable."); return; }
+  if(joueur.statut!=='en_attente'){
+    alert("Seul un dossier en attente peut être rejeté.");
+    return;
+  }
+  const motif = prompt(
+    `Motif du rejet du dossier de ${joueur.prenom} ${joueur.nom} :\n`+
+    `(ex : photo illisible, extrait de naissance non conforme, âge hors catégorie...)`
+  );
+  if(motif===null) return; // annulé par l'utilisateur
+  if(!motif.trim()){
+    alert("Un motif est obligatoire pour rejeter un dossier.");
+    return;
+  }
+  joueur.statut = 'rejete';
+  joueur.motif_rejet = motif.trim();
+  joueur.date_rejet = Date.now();
+  joueur.updated_at = Date.now();
+  sauverDB({joueurs:[joueur.id]});
+  afficherListeJoueurs(); afficherHistorique(); rafraichirStats();
+  alert(`⛔ Dossier de ${joueur.prenom} ${joueur.nom} rejeté.\nMotif : ${joueur.motif_rejet}`);
+}
+window.rejeterJoueur = rejeterJoueur;
+
+function remettreEnAttente(id){
+  if(!estAdmin()) return;
+  const joueur = DB.joueurs.find(j=>j.id===id);
+  if(!joueur || joueur.statut!=='rejete') return;
+  if(!confirm(`Remettre le dossier de ${joueur.prenom} ${joueur.nom} en attente de validation ?`)) return;
+  joueur.statut = 'en_attente';
+  joueur.motif_rejet = null;
+  joueur.date_rejet = null;
+  joueur.updated_at = Date.now();
+  sauverDB({joueurs:[joueur.id]});
+  afficherListeJoueurs(); afficherHistorique(); rafraichirStats();
+}
+window.remettreEnAttente = remettreEnAttente;
 
 /* =========================================================
    HISTORIQUE DES LICENCES (générées / validées / prêtes à l'impression)
@@ -1627,11 +1705,11 @@ function afficherHistorique(){
   if(!tb) return;
   tb.innerHTML = '';
   const filtre = selectFiltre ? selectFiltre.value : '';
-  let liste = DB.joueurs.filter(j=>j.numero_licence || j.date_generation);
+  let liste = DB.joueurs.filter(j=>j.numero_licence || j.date_generation || j.statut==='rejete');
   if(filtre) liste = liste.filter(j=>j.asc_id===filtre);
-  liste = liste.slice().sort((a,b)=>(b.date_generation||0)-(a.date_generation||0));
+  liste = liste.slice().sort((a,b)=>(b.date_generation||b.date_rejet||0)-(a.date_generation||a.date_rejet||0));
   if(liste.length===0){
-    tb.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#888">Aucune licence générée pour le moment.</td></tr>';
+    tb.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#888">Aucune licence générée pour le moment.</td></tr>';
     return;
   }
   liste.forEach(j=>{
@@ -1639,6 +1717,8 @@ function afficherHistorique(){
     const pretCell = j.pret_impression
       ? `✅ ${formaterDate(j.date_impression)}`
       : '<span style="color:#999">—</span>';
+    const badgeClass = j.statut==='valide'?'valide':(j.statut==='rejete'?'rejete':'attente');
+    const badgeTitle = (j.statut==='rejete' && j.motif_rejet) ? ` title="Motif du rejet : ${j.motif_rejet.replace(/"/g,'&quot;')}"` : '';
     let actions = `<button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="allerVersLicence('${j.id}')">🪪 Voir</button>`;
     if(j.statut==='valide'){
       actions += j.pret_impression
@@ -1649,9 +1729,13 @@ function afficherHistorique(){
       } else if(j.pieces_jointes_purgees){
         actions += ` <span style="color:#8a9a8a;font-size:11px" title="Photo/extrait déjà supprimés">✓ Allégé</span>`;
       }
+    } else if(j.statut==='rejete'){
+      actions += ` <button class="btn secondary" style="padding:5px 8px;font-size:11px" onclick="remettreEnAttente('${j.id}')">↩️ Remettre en attente</button>`;
     }
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${j.prenom} ${j.nom}</td><td>${asc.nom}</td><td>${j.numero_licence||'—'}</td>
+    tr.innerHTML = `<td>${j.prenom} ${j.nom}</td><td>${asc.nom}</td>
+      <td><span class="badge ${badgeClass}"${badgeTitle}>${j.statut.replace('_',' ')}</span></td>
+      <td>${j.numero_licence||'—'}</td>
       <td>${formaterDate(j.date_generation)}</td>
       <td>${formaterDate(j.date_validation)}</td>
       <td>${pretCell}</td>
@@ -1688,6 +1772,7 @@ function rafraichirStats(){
   document.getElementById('statValides').textContent = joueurs.filter(j=>j.statut==='valide').length;
   document.getElementById('statPrete').textContent = joueurs.filter(j=>j.pret_impression).length;
   document.getElementById('statAttente').textContent = joueurs.filter(j=>j.statut==='en_attente').length;
+  document.getElementById('statRejetes').textContent = joueurs.filter(j=>j.statut==='rejete').length;
   majAffichageEspace();
 }
 
@@ -1726,12 +1811,23 @@ function afficherComptes(){
   DB.comptes.forEach(c=>{
     const asc = c.asc_id ? (DB.asc.find(a=>a.id===c.asc_id) || {nom:'—'}) : null;
     const nbJoueurs = c.asc_id ? DB.joueurs.filter(j=>j.asc_id===c.asc_id).length : '—';
+    const enAttente = c.role==='secretaire' && c.statut==='en_attente';
+    const statutBadge = c.role==='secretaire'
+      ? ` <span class="badge ${enAttente?'attente':'valide'}">${enAttente?'en attente':'actif'}</span>`
+      : '';
+    let actions = '—';
+    if(c.role!=='admin'){
+      actions = enAttente
+        ? `<button class="btn" style="padding:5px 8px;font-size:11px" onclick="validerCompte('${c.login}')">✅ Valider</button>
+           <button class="btn rouge" style="padding:5px 8px;font-size:11px" onclick="refuserCompte('${c.login}')">❌ Refuser</button>`
+        : `<button class="btn rouge" onclick="supprimerCompte('${c.login}')">Suppr.</button>`;
+    }
     const tr = document.createElement('tr');
     tr.innerHTML = `<td><b>${c.login}</b></td>
-      <td><span class="badge role-${c.role}">${c.role}</span></td>
+      <td><span class="badge role-${c.role}">${c.role}</span>${statutBadge}</td>
       <td>${asc ? asc.nom : '—'}</td>
       <td>${nbJoueurs}</td>
-      <td class="actions">${c.role==='admin' ? '—' : `<button class="btn rouge" onclick="supprimerCompte('${c.login}')">Suppr.</button>`}</td>`;
+      <td class="actions">${actions}</td>`;
     tb.appendChild(tr);
   });
 }
@@ -1741,6 +1837,47 @@ function supprimerCompte(login){
   sauverDB({comptes:true});
   afficherComptes();
 }
+
+/* =========================================================
+   VALIDATION ADMIN DES DEMANDES DE COMPTE SECRÉTAIRE GÉNÉRAL
+   ---------------------------------------------------------
+   Un compte fraîchement auto-inscrit a le statut "en_attente" et
+   ne peut pas se connecter (voir seConnecter). L'admin doit soit
+   le valider (statut -> "actif"), soit le refuser. En cas de refus,
+   si aucun joueur n'a encore été rattaché à l'ASC créée lors de
+   l'inscription, elle est supprimée avec le compte ; sinon elle
+   est conservée (des données existent déjà dessus).
+   ========================================================= */
+function validerCompte(login){
+  const compte = DB.comptes.find(c=>c.login===login);
+  if(!compte) return;
+  compte.statut = 'actif';
+  compte.updated_at = Date.now();
+  sauverDB({comptes:true});
+  afficherComptes();
+  alert(`✅ Compte « ${login} » validé. Le Secrétaire Général peut désormais se connecter.`);
+}
+window.validerCompte = validerCompte;
+
+function refuserCompte(login){
+  const compte = DB.comptes.find(c=>c.login===login);
+  if(!compte) return;
+  const asc = compte.asc_id ? DB.asc.find(a=>a.id===compte.asc_id) : null;
+  const nbJoueurs = asc ? DB.joueurs.filter(j=>j.asc_id===asc.id).length : 0;
+  const messageAsc = asc
+    ? `\n\nL'ASC « ${asc.nom} » associée sera ${nbJoueurs>0 ? 'CONSERVÉE (des joueurs y sont déjà rattachés)' : 'supprimée également (aucun joueur rattaché)'}.`
+    : '';
+  if(!confirm(`Refuser la demande de compte « ${login} » ?${messageAsc}`)) return;
+  DB.comptes = DB.comptes.filter(c=>c.login!==login);
+  if(asc && nbJoueurs===0){
+    DB.asc = DB.asc.filter(a=>a.id!==asc.id);
+    sauverDB({comptes:true, asc:[asc.id]});
+  } else {
+    sauverDB({comptes:true});
+  }
+  afficherComptes(); afficherAscTable(); remplirSelectAsc(); rafraichirStats();
+}
+window.refuserCompte = refuserCompte;
 
 /* =========================================================
    GÉNÉRATION DE LA LICENCE (CANVAS)
