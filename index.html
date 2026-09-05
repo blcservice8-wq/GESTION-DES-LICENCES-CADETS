@@ -417,6 +417,21 @@ function chargerDB(){
   return db;
 }
 
+/* Migration : les installations déjà en place (créées avant ce changement)
+   ont encore le mot de passe admin par défaut "admin123" enregistré dans
+   leur localStorage / Firestore. On le remplace automatiquement par
+   "zone13c" au premier chargement qui suit la mise à jour, sans toucher
+   au reste des données (ASC, joueurs...). Sans effet sur les installations
+   où le mot de passe a déjà été changé manuellement par l'administrateur. */
+function migrerMotDePasseAdminParDefaut(){
+  const adminDefaut = DB.comptes.find(c => c.role==='admin' && c.login==='admin' && c.pwd==='admin123');
+  if(!adminDefaut) return;
+  adminDefaut.pwd = 'zone13c';
+  adminDefaut.updated_at = Date.now();
+  sauverDB({comptes:true});
+  console.warn('Mot de passe admin par défaut mis à jour automatiquement (admin123 → zone13c).');
+}
+
 /* Taille approximative (en octets) occupée par la base dans localStorage.
    Sert à afficher l'espace utilisé et à détecter qu'on approche de la
    limite du navigateur (souvent 5 à 10 Mo par site sur téléphone). */
@@ -847,6 +862,7 @@ async function initFirebaseSync(){
 window.initFirebaseSync = initFirebaseSync;
 
 let DB = chargerDB();
+migrerMotDePasseAdminParDefaut();
 
 /* ID unique anti-collision (corrige les pertes de données en sync multi-appareils) */
 function genererIdUnique(){
